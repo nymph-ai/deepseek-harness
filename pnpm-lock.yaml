@@ -1421,6 +1421,9 @@ importers:
       '@deepseek-ai/schemastery':
         specifier: link:../../../vendor/schemastery
         version: link:../../../vendor/schemastery
+      acp-v2-sdk:
+        specifier: npm:@agentclientprotocol/sdk@2.8.0
+        version: '@agentclientprotocol/sdk@2.8.0(zod@4.6.6)'
     devDependencies:
       '@deepseek-ai/cordis':
         specifier: workspace:~
@@ -20786,6 +20789,15 @@ packages:
     peerDependencies:
       zod: ^3.25.0 || ^4.0.0
 
+  '@agentclientprotocol/sdk@2.8.0':
+    resolution: {integrity: sha512-EjsvoRX8nEH2z3PAVI2ILsVXAefVcSlLPeXGjlQoFgkJE71F2J0Fj7N6oL/k7SnP0vY+9hmONPFz/K2zalnTiw==}
+    peerDependencies:
+      '@modelcontextprotocol/server': ^2.4.0
+      zod: ^3.25.76 || ^4.0.0
+    peerDependenciesMeta:
+      '@modelcontextprotocol/server':
+        optional: true
+
   '@algolia/abtesting@1.21.2':
     resolution: {integrity: sha512-uXj0rgk30EpsKvOpuS+R+1XFDrnm56hED1Lz56e8uBkZdKCxw99LS2U8eXBqAHYU8kpkbsnV1GC8velBG070Hg==}
     engines: {node: '>= 14.0.0'}
@@ -28513,6 +28525,10 @@ packages:
 snapshots:
 
   '@agentclientprotocol/sdk@1.4.0(zod@4.6.6)':
+    dependencies:
+      zod: 4.6.6
+
+  '@agentclientprotocol/sdk@2.8.0(zod@4.6.6)':
     dependencies:
       zod: 4.6.6
 

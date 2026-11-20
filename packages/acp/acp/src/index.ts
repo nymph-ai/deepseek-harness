@@ -43,9 +43,11 @@ import {
   type SetSessionConfigOptionRequest,
   type SetSessionConfigOptionResponse,
   type SessionNotification,
+  type SessionConfigOption,
   type Stream,
 } from '@agentclientprotocol/sdk'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import * as v2 from 'acp-v2-sdk/experimental/v2/unstable'
+import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 // Side-effect type import: declaration-merges the approval waterfall answered below.
 import type {} from '@deepseek-ai/dsh-user-approval'
@@ -70,6 +72,79 @@ function internalError(detail: string): RequestError {
   return RequestError.internalError(undefined, detail)
 }
 
+function parseKeyedPrompt(value: unknown): PromptRequest & { idempotencyKey: string } {
+  if (typeof value !== 'object' || value === null || !('sessionId' in value)
+    || typeof value.sessionId !== 'string' || !('idempotencyKey' in value) || typeof value.idempotencyKey !== 'string'
+    || value.idempotencyKey.length === 0 || Array.from(value.idempotencyKey).length > 255 || !('prompt' in value)
+    || !Array.isArray(value.prompt) || value.prompt.length === 0) {
+    throw invalidParams('expected a sessionId, 1–255 character idempotencyKey, and nonempty text prompt')
+  }
+  return {
+    sessionId: value.sessionId,
+    idempotencyKey: value.idempotencyKey,
+    prompt: value.prompt.map((block: unknown) => {
+      if (typeof block !== 'object' || block === null || !('type' in block) || block.type !== 'text'
+        || !('text' in block) || typeof block.text !== 'string') {
+        throw invalidParams('the keyed prompt extension accepts text content only')
+      }
+      return { type: 'text', text: block.text }
+    }),
+  }
+}
+
+async function v2Result<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run()
+  } catch (error: unknown) {
+    if (error instanceof RequestError) throw new v2.RequestError(error.code, error.message, error.data)
+    throw error
+  }
+}
+
+function v2Config(options: SessionConfigOption[] | null | undefined): v2.SessionConfigOption[] {
+  return (options ?? []).flatMap((option) => {
+    if (option.type !== 'select') return []
+    const { id, options, ...fields } = option
+    return [{
+      ...fields,
+      configId: id,
+      options: options.map((value) => {
+        if (!('group' in value)) return value
+        const { group, ...details } = value
+        return { groupId: group, ...details }
+      }) as v2.SessionConfigSelectOptions,
+    }]
+  })
+}
+
+function v2Message(event: SessionEvent): Extract<v2.SessionUpdate, { sessionUpdate: 'user_message' | 'agent_message' }> | undefined {
+  if (event.type !== 'user/message' && event.type !== 'assistant/message') return undefined
+  if (event.type === 'user/message' && event.data.source.kind !== 'user') return undefined
+  const message = event.type === 'user/message' ? event.data : event.data.message
+  const content = message.content.flatMap(block => block.type === 'text'
+    ? [{ type: 'text' as const, text: block.text }]
+    : [])
+  return event.type === 'user/message'
+    ? { sessionUpdate: 'user_message', messageId: message.id, content }
+    : { sessionUpdate: 'agent_message', messageId: message.id, content }
+}
+
+function v2Settlement(reason: PromptResponse['stopReason'] | 'error'): v2.SessionUpdate {
+  const idle = { sessionUpdate: 'state_update', state: 'idle' } as const
+  switch (reason) {
+    case 'error':
+      return { ...idle, stopReason: 'error', error: { code: -32603, message: 'DeepSeek Harness turn failed' } }
+    case 'cancelled':
+      return { ...idle, stopReason: 'cancelled' }
+    case 'max_tokens':
+      return { ...idle, stopReason: 'max_tokens' }
+    case 'refusal':
+      return { ...idle, stopReason: 'refusal' }
+    default:
+      return { ...idle, stopReason: 'end_turn' }
+  }
+}
+
 /** Plugin config: the provider/model selection used for each ACP-created agent. */
 export interface AcpConfig {
   /** Provider route for created agents. */
@@ -78,6 +153,8 @@ export interface AcpConfig {
   model?: string
   /** Maximum summaries returned by one session/list page. */
   sessionListPageSize?: number
+  /** Opt in to the text-focused ACP v2 preview alongside ACP v1. */
+  protocolV2?: boolean
   /** Runtime-only transport override; production uses stdio. */
   stream?: Stream
 }
@@ -86,6 +163,7 @@ export const Config: Schema<AcpConfig> = Schema.object({
   provider: Schema.string(),
   model: Schema.string(),
   sessionListPageSize: Schema.natural().min(1).default(DEFAULT_SESSION_LIST_PAGE_SIZE),
+  protocolV2: Schema.boolean().default(false),
 })
 
 /**
@@ -103,6 +181,17 @@ export function apply(ctx: Context, config: AcpConfig): void {
   const activating = new Set<SessionId>()
   let closed = false
   let imagePromptEnabled = false
+  let v2Client: v2.AgentContext | undefined
+  const v2Updates = new Map<SessionId, Promise<void>>()
+
+  const notifyV2 = (sessionId: SessionId, update: v2.SessionUpdate): Promise<void> => {
+    const tail = v2Updates.get(sessionId) ?? Promise.resolve()
+    const sent = tail.then(() => v2Client?.notify(v2.methods.client.session.update, { sessionId, update }))
+    v2Updates.set(sessionId, sent.catch((error: unknown) => {
+      logger.warn(`acp v2: session/update failed: ${String(error)}`)
+    }))
+    return sent
+  }
 
   /** Return the bridge-owned record for an agent, rejecting same-id impostors. */
   const ownedRecord = (agent: Parameters<AcpSession['owns']>[0]): AcpSession | undefined => {
@@ -123,6 +212,20 @@ export function apply(ctx: Context, config: AcpConfig): void {
   /** Send one ordered protocol update while containing transport-only failure. */
   const notify = async (notification: SessionNotification): Promise<void> => {
     try {
+      if (v2Client !== undefined) {
+        const { update } = notification
+        const id = brandString<SessionId>(notification.sessionId)
+        if (update.sessionUpdate === 'config_option_update') {
+          await notifyV2(id, { sessionUpdate: 'config_option_update', configOptions: v2Config(update.configOptions) })
+        } else if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
+          const { content, ...fields } = update
+          const display = content?.filter(item => item.type === 'content') as v2.ToolCallContent[] | undefined
+          await notifyV2(id, { ...fields, sessionUpdate: 'tool_call_update', ...(display === undefined ? {} : { content: display }) })
+        } else if (update.sessionUpdate === 'usage_update') {
+          await notifyV2(id, update)
+        }
+        return
+      }
       await conn.notify(methods.client.session.update, notification)
     /* v8 ignore start -- the ACP SDK contains notification-handler failures; only a transport write failure reaches this guard. */
     } catch (error: unknown) {
@@ -133,7 +236,15 @@ export function apply(ctx: Context, config: AcpConfig): void {
 
   ctx.on('session/event', (session, event) => {
     const record = sessions.get(session.header.id)
-    if (record?.ownsSession(session) === true) record.onSessionEvent(session, event)
+    if (record?.ownsSession(session) !== true) return
+    record.onSessionEvent(session, event)
+    if (v2Client !== undefined) {
+      if (event.type === 'turn/start') {
+        void notifyV2(session.header.id, { sessionUpdate: 'state_update', state: 'running' }).catch(() => {})
+      }
+      const update = v2Message(event)
+      if (update !== undefined) void notifyV2(session.header.id, update).catch(() => {})
+    }
   })
 
   ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
@@ -168,10 +279,18 @@ export function apply(ctx: Context, config: AcpConfig): void {
           { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
         ],
       }
+      if (v2Client !== undefined) {
+        return v2Client.request(v2.methods.client.session.requestPermission, {
+          sessionId: params.sessionId,
+          title: 'DeepSeek Harness requests permission',
+          subject: { type: 'tool_call', toolCall: { toolCallId: callId } },
+          options: params.options,
+        })
+      }
       return conn.request(methods.client.session.requestPermission, params)
     }).then(({ outcome }) => {
       if (outcome.outcome === 'cancelled') return 'cancelled'
-      return outcome.optionId === 'allow-once' ? 'allowed-once' : 'rejected'
+      return 'optionId' in outcome && outcome.optionId === 'allow-once' ? 'allowed-once' : 'rejected'
     })
   })
 
@@ -388,8 +507,83 @@ export function apply(ctx: Context, config: AcpConfig): void {
     .onRequest(methods.agent.session.setConfigOption, ({ params, signal }) => implementation.setSessionConfigOption(params, signal))
     .onRequest(methods.agent.session.prompt, ({ params, signal }) => implementation.prompt(params, signal))
     .onNotification(methods.agent.session.cancel, ({ params }) => implementation.cancel(params))
-  const connection = app.connect(stream)
-  const conn: AgentContext = connection.client
+  let conn: AgentContext
+  const connectV1 = (transport: Stream) => {
+    const connection = app.connect(transport)
+    conn = connection.client
+    return connection
+  }
+  const v2App = v2.agent({ name: 'deepseek-harness-acp' })
+    .onConnect(({ client }) => { v2Client = client })
+    .onRequest(v2.methods.agent.initialize, () => ({
+      protocolVersion: 2,
+      info: { name: 'deepseek-harness-acp', version: '0.0.1' },
+      _meta: { 'nymph.ai/fabric': { keyedTextPrompts: true } },
+    }))
+    .onRequest(v2.methods.agent.session.new, ({ params, signal }) => v2Result(async () => {
+      if (params.additionalDirectories?.length || params.mcpServers?.length
+        || params.configOptions?.length || params.systemPrompt != null) {
+        throw invalidParams('this ACP v2 preview accepts a primary cwd only')
+      }
+      const { sessionId, configOptions } = await implementation.newSession({ cwd: params.cwd, mcpServers: [] }, signal)
+      return { sessionId, configOptions: v2Config(configOptions) }
+    }))
+    .onRequest(v2.methods.agent.session.list, ({ params, signal }) => v2Result(() => implementation.listSessions(params, signal)))
+    .onRequest(v2.methods.agent.session.resume, ({ params, signal }) => v2Result(async () => {
+      if (params.additionalDirectories?.length || params.mcpServers?.length || params.systemPrompt != null) {
+        throw invalidParams('this ACP v2 preview accepts a primary cwd only')
+      }
+      if (params.replayFrom != null && params.replayFrom.type !== 'start') {
+        throw invalidParams('this ACP v2 preview supports replay from the start only')
+      }
+      const sessionId = brandString<SessionId>(params.sessionId)
+      const { configOptions } = await implementation.resumeSession({ sessionId, cwd: params.cwd, mcpServers: [] }, signal)
+      try {
+        if (params.replayFrom != null) {
+          const reader = await persistence.open(sessionId, 'read')
+          try {
+            for (const event of (await reader.read()).events) {
+              const update = v2Message(event)
+              if (update !== undefined) await notifyV2(sessionId, update)
+            }
+          } finally {
+            await reader.close()
+          }
+          await notifyV2(sessionId, { sessionUpdate: 'replay_complete' })
+        }
+        await notifyV2(sessionId, { sessionUpdate: 'state_update', state: 'idle', stopReason: null })
+      } catch (error: unknown) {
+        await implementation.closeSession({ sessionId })
+        v2Updates.delete(sessionId)
+        throw error
+      }
+      return { configOptions: v2Config(configOptions) }
+    }))
+    .onRequest(v2.methods.agent.session.prompt, ({ params, signal }) => v2Result(() => {
+      const prompt = parseKeyedPrompt({ ...params, idempotencyKey: params.idempotencyKey ?? randomUUID() })
+      const id = brandString<SessionId>(params.sessionId)
+      return requireSession(id).promptWithId(prompt, prompt.idempotencyKey, false, persistence, signal, (reason) => {
+        void notifyV2(id, v2Settlement(reason)).catch(() => {})
+      })
+    }))
+    .onNotification(v2.methods.agent.session.cancel, ({ params }) => implementation.cancel(params))
+    .onRequest(v2.methods.agent.session.close, ({ params }) => v2Result(async () => {
+      const id = brandString<SessionId>(params.sessionId)
+      const response = await implementation.closeSession(params)
+      await v2Updates.get(id)
+      v2Updates.delete(id)
+      return response
+    }))
+    .onRequest(v2.methods.agent.session.setConfigOption, ({ params, signal }) => v2Result(async () => {
+      if (params.type !== 'id' || typeof params.value !== 'string') throw invalidParams('config options use string IDs')
+      const { configOptions } = await implementation.setSessionConfigOption({
+        sessionId: params.sessionId, configId: params.configId, value: params.value,
+      }, signal)
+      return { configOptions: v2Config(configOptions) }
+    }))
+  const connection = config.protocolV2 === true
+    ? v2.agentProtocolRouter().withV1({ connect: connectV1 }).withV2(v2App).connect(stream)
+    : connectV1(stream)
 
   let quiescing: Promise<void> | undefined
   const quiesce = (): Promise<void> => {

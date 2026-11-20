@@ -18,6 +18,7 @@ import {
   type SessionNotification,
   type Stream,
 } from '@agentclientprotocol/sdk'
+import * as v2 from 'acp-v2-sdk/experimental/v2/unstable'
 import AttachmentStore, { AttachmentError } from '@deepseek-ai/dsh-attachment'
 import type { AttachmentId } from '@deepseek-ai/dsh-attachment/types'
 import { brandString } from '@deepseek-ai/dsh-brand'
@@ -199,6 +200,8 @@ interface BridgeClient {
 export interface BridgeHarness {
   ctx: Context
   client: BridgeClient
+  v2Client?: v2.ClientContext
+  v2Updates: v2.UpdateSessionNotification[]
   adapter: MockAdapter
   attachments: MemoryAttachmentStore | undefined
   updates: CapturedUpdate[]
@@ -227,6 +230,7 @@ export async function makeBridgeHarness(options: {
   imageCapable?: boolean
   attachments?: boolean
   persistenceRoot?: string
+  connectV2?: boolean
 } = {}): Promise<BridgeHarness> {
   const adapter = new MockAdapter(options.script ?? [], options.imageCapable === true)
   const ctx = new Context()
@@ -256,6 +260,7 @@ export async function makeBridgeHarness(options: {
     adapter,
     attachments: ctx.get('attachments') as MemoryAttachmentStore | undefined,
     updates,
+    v2Updates: [],
     sessionUpdates,
     permissionRequests,
     persistenceRoot,
@@ -294,6 +299,12 @@ export async function makeBridgeHarness(options: {
     inject: [...AcpPlugin.inject],
     apply: (inner: Context) => { AcpPlugin.apply(inner, config) },
   })
+  if (options.connectV2 === true) {
+    harness.v2Client = v2.client({ name: 'dsh-acp-test-client' })
+      .onNotification(v2.methods.client.session.update, ({ params }) => { harness.v2Updates.push(params) })
+      .connect(clientStream).agent
+    return harness
+  }
   const clientConnection = clientApp.connect(clientStream)
   const client = clientConnection.agent
   harness.client = {

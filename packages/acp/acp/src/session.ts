@@ -2,6 +2,7 @@
 
 import type {} from '@deepseek-ai/dsh-fs'
 import type { Context } from '@deepseek-ai/cordis'
+import { createHash } from 'node:crypto'
 import {
   RequestError,
   type McpServer,
@@ -13,7 +14,9 @@ import {
 } from '@agentclientprotocol/sdk'
 import type { Agent, AgentHandle, AgentOptions, AgentStatus } from '@deepseek-ai/dsh-agent'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
-import { createUserMessage, errorChain, type UserMessage } from '@deepseek-ai/dsh-llm'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import { createUserMessage, errorChain, type MessageId, type UserMessage } from '@deepseek-ai/dsh-llm'
+import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { type Session, type SessionEvent, type SessionId, type TurnEndReason } from '@deepseek-ai/dsh-session'
 import { AcpContentError, admitAcpPrompt } from './content.ts'
 import { turnEndToStopReason } from './codec.ts'
@@ -63,6 +66,11 @@ interface InflightPrompt {
   settlementStarted: boolean
   outputError: Error | undefined
   agentError: Error | undefined
+  keyed: {
+    id: MessageId
+    committed: boolean
+    durable: PromiseWithResolvers<void>
+  } | undefined
 }
 
 /** Standard invalid-parameter failure with protocol-safe detail. */
@@ -97,6 +105,7 @@ export class AcpSession {
   private outputTail = Promise.resolve()
   private inflight: InflightPrompt | undefined
   private closing: Promise<void> | undefined
+  private readonly keyedPrompts = new Map<MessageId, Promise<{ messageId: string }>>()
 
   private constructor(
     private readonly ctx: Context,
@@ -218,12 +227,14 @@ export class AcpSession {
    * @param params - standard ACP prompt request for this session.
    * @param imageEnabled - connection capability advertised at initialization.
    * @param requestSignal - JSON-RPC request cancellation signal.
+   * @param keyed - optional native message identity and its durability signal.
    * @returns the correlated standard stop reason after ordered updates drain.
    */
   async prompt(
     params: PromptRequest,
     imageEnabled: boolean,
     requestSignal?: AbortSignal,
+    keyed?: InflightPrompt['keyed'],
   ): Promise<PromptResponse> {
     this.assertActive()
     if (this.inflight !== undefined) throw invalidParams('a prompt is already in flight for this session')
@@ -245,6 +256,7 @@ export class AcpSession {
       settlementStarted: false,
       outputError: undefined,
       agentError: undefined,
+      keyed,
     }
     this.inflight = inflight
     const onRequestAbort = (): void => { this.cancelPrompt('ACP prompt request cancelled') }
@@ -269,10 +281,11 @@ export class AcpSession {
         if (this.ctx.agents.get(this.agent.id) !== this.agent) {
           throw internalError('prompt was not queued: the agent was disposed outside the bridge')
         }
-        const message = createUserMessage({
+        const native = createUserMessage({
           content,
           source: { kind: 'user' },
         })
+        const message = keyed === undefined ? native : Object.freeze({ ...native, id: keyed.id })
         inflight.messageId = message.id
         inflight.messageQueued = true
         try {
@@ -309,6 +322,65 @@ export class AcpSession {
     }
   }
 
+  /**
+   * Acknowledge native insertion separately from foreground settlement.
+   * @param params - the prompt and the session that owns it.
+   * @param key - idempotency key scoped to this native session.
+   * @param imageEnabled - connection capability used during prompt admission.
+   * @param persistence - durable session history used to resolve retained retries.
+   * @param signal - JSON-RPC request cancellation signal.
+   * @param onSettled - optional callback for foreground completion of a newly inserted prompt.
+   * @returns the stable receipt for a retained or newly persisted user message.
+   */
+  async promptWithId(
+    params: PromptRequest,
+    key: string,
+    imageEnabled: boolean,
+    persistence: SessionPersistence,
+    signal: AbortSignal,
+    onSettled?: (reason: StopReason | 'error') => void,
+  ): Promise<{ messageId: string }> {
+    this.assertActive()
+    const session = this.agent.session
+    const id = brandString<MessageId>('acp-prompt-v2:' + createHash('sha256')
+      .update(JSON.stringify([session.id, key])).digest('hex'))
+    const pending = this.keyedPrompts.get(id)
+    if (pending !== undefined) return pending
+    const receipt = (async () => {
+      signal.throwIfAborted()
+      const retained = await this.ctx.sessions.flush(session)
+      if (!retained) throw internalError('no session durability listener is available')
+      const reader = await persistence.open(session.id, 'read')
+      try {
+        const { events } = await reader.read()
+        if (events.some(event => event.type === 'user/message' && event.data.id === id)) {
+          return { messageId: id }
+        }
+      } finally {
+        await reader.close()
+      }
+      const keyed = { id, committed: false, durable: Promise.withResolvers<void>() }
+      void this.prompt(params, imageEnabled, signal, keyed).then(({ stopReason }) => {
+        if (keyed.committed) onSettled?.(stopReason)
+        if (keyed.committed) return
+        keyed.durable.reject(stopReason === 'cancelled'
+          ? RequestError.requestCancelled()
+          : internalError('the prompt settled before a native user message was committed'))
+      }, (error: unknown) => {
+        if (keyed.committed) onSettled?.('error')
+        if (!keyed.committed) keyed.durable.reject(error)
+      })
+      await keyed.durable.promise
+      return { messageId: id }
+    })()
+    this.keyedPrompts.set(id, receipt)
+    try {
+      return await receipt
+    } finally {
+      this.keyedPrompts.delete(id)
+    }
+  }
+
   /** Cancel the active prompt, or autonomous work when no ACP prompt exists. */
   cancel(): void {
     const inflight = this.inflight
@@ -322,6 +394,13 @@ export class AcpSession {
    * @param event - committed durable event.
    */
   onSessionEvent(session: Session, event: SessionEvent): void {
+    const keyed = this.inflight?.keyed
+    if (keyed !== undefined && !keyed.committed && event.type === 'user/message' && event.data.id === keyed.id) {
+      keyed.committed = true
+      void Promise.resolve().then(async () => {
+        if (!await this.ctx.sessions.flush(session)) throw internalError('no session durability listener is available')
+      }).then(keyed.durable.resolve, keyed.durable.reject)
+    }
     if (event.type === 'turn/start' && this.inflight?.turn !== undefined) {
       this.inflight.turn = event.data.turn
       this.inflight.endReason = undefined
