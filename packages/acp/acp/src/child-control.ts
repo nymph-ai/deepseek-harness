@@ -5,7 +5,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import type { SubagentRunInfo } from '@deepseek-ai/dsh-subagent'
 import type { SessionUpdate, StateUpdate } from 'acp-v2-sdk/experimental/v2/unstable'
-import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
+import { SessionHandleClosedError, type SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { localCatalogChild } from './child-history.ts'
 
 type IdleState = Extract<StateUpdate, { state: 'idle' }>
@@ -169,13 +169,15 @@ export class V2ChildControl {
       seen.add(parentId)
       const live = this.ctx.sessions.get(parentId)
       if (live !== undefined) {
-        const flushed = await this.ctx.sessions.flush(live).catch((error: unknown) => {
-          if (this.ctx.sessions.get(parentId) !== undefined) throw error
-          return false
-        })
-        // Natural creator teardown can detach its live handle during flush.
-        // Follow its retained catalog below, keeping the same creator identity.
-        if (!flushed && this.ctx.sessions.get(parentId) !== undefined) return
+        try {
+          if (!await this.ctx.sessions.flush(live) && this.ctx.sessions.get(parentId) !== undefined) return
+        } catch (error: unknown) {
+          const current = this.ctx.sessions.get(parentId)
+          // Disposal can close the writer before it detaches the Session.
+          // The read handle waits for the closing writer's final drain.
+          if (current !== undefined
+            && (current !== live || !(error instanceof SessionHandleClosedError) || error.sessionId !== parentId)) throw error
+        }
       }
       await using reader = await this.persistence.open(parentId, 'read')
       if (reader.header.id !== parentId || (live !== undefined && reader.header.createdAt !== live.header.createdAt)) return
