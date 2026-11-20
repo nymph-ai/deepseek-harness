@@ -18,7 +18,7 @@
 
 - `inject`: `agents` · `llm` · `sessionPersistence` · `sessions`
 - `refs`: `Stream` (`@agentclientprotocol/sdk`)
-- `source`: [`packages/acp/acp/src/index.ts:173`](../packages/acp/acp/src/index.ts)
+- `source`: [`packages/acp/acp/src/index.ts:174`](../packages/acp/acp/src/index.ts)
 
 ```ts config-catalog
 /** Plugin config: the provider/model selection used for each ACP-created agent. */
@@ -33,8 +33,18 @@ export interface AcpConfig {
   protocolV2?: boolean
   /** Absolute persistent signing key path to enable native ACP v2 cursors. */
   cursorSigningKeyFile?: string
+  /** Operator-pinned native stdio channel-reply helper and socket for ACP v2 resume. */
+  channelReplyMcp?: ChannelReplyMcp | undefined
   /** Runtime-only transport override; production uses stdio. */
   stream?: Stream
+}
+
+/** Local operator configuration for the delegated reply transport. */
+export interface ChannelReplyMcp {
+  /** Absolute path to the world-mcp-channel-reply executable. */
+  command: string
+  /** Absolute path to the authenticated fabd socket. */
+  socket: string
 }
 ```
 <!-- END GENERATED config-catalog:@deepseek-ai/dsh-acp -->
