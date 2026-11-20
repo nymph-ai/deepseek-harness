@@ -92,7 +92,10 @@ describe('automation-only ACP bridge', () => {
       const client = harness.v2Client!
       await expect(initialize(client)).resolves.toMatchObject({
         protocolVersion: 2, capabilities: { session: {} },
-        _meta: { 'nymph.ai/fabric': { keyedTextPrompts: true, keyedTextSteering: true }, steering: { supported: true } },
+        _meta: {
+          'nymph.ai/fabric': { keyedTextPrompts: true, keyedResourceLinkPrompts: true, keyedTextSteering: true },
+          steering: { supported: true },
+        },
       })
       const { sessionId } = await client.request(m.session.new, { cwd })
       const params = { sessionId, idempotencyKey: 'keyed', prompt: [

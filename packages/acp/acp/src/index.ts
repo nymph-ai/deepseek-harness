@@ -601,6 +601,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
       _meta: {
         'nymph.ai/fabric': {
           keyedTextPrompts: true,
+          keyedResourceLinkPrompts: true,
           keyedTextSteering: true,
           ...signingKey === undefined ? {} : { replayFromCursor: FABRIC_CURSOR_REPLAY },
         },
