@@ -64,6 +64,8 @@ An explicit v2 replay restores read-only first-level associations for selected, 
 
 While a directly owned in-process child runs a native turn, its parent association grants `capabilities.cancel`. Send `session/cancel` with that child's ID to interrupt that turn. The bridge reports cancelled idle only after the same turn records an ancestor interruption and the child becomes idle. The capability is withdrawn at idle; detached roots and retained replay grant no live control.
 
+ACP v2 holds new prompt requests in arrival order while the preceding prompt and its descendants settle. A retained keyed receipt is returned during foreground work. Cancelling or closing the parent rejects held, uninserted requests with `-32800`. Close waits for the parent's own native descendants to stop and flush before responding.
+
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-acp) is the exhaustive source for every accepted field and its JSDoc.
 
 ### Start a server
