@@ -86,10 +86,13 @@ describe('automation-only ACP bridge', () => {
       harness = await makeHarness([textResponse('committed answer')])
       const client = harness.v2Client!
       await expect(initialize(client)).resolves.toMatchObject({
-        protocolVersion: 2, _meta: { 'nymph.ai/fabric': { keyedTextPrompts: true } },
+        protocolVersion: 2, capabilities: { session: {} }, _meta: { 'nymph.ai/fabric': { keyedTextPrompts: true } },
       })
       const { sessionId } = await client.request(m.session.new, { cwd })
-      const params = { sessionId, idempotencyKey: 'keyed', prompt: [{ type: 'text' as const, text: 'retain me' }] }
+      const params = { sessionId, idempotencyKey: 'keyed', prompt: [
+        { type: 'text' as const, text: 'retain me' },
+        { type: 'resource_link' as const, name: 'reference', uri: 'file:///fixture.txt' },
+      ] }
       const receipt = await client.request(m.session.prompt, params)
       await expect(client.request(m.session.prompt, params)).resolves.toEqual(receipt)
       await vi.waitFor(() => { expect(harness?.v2Updates).toContainEqual({
@@ -104,7 +107,9 @@ describe('automation-only ACP bridge', () => {
       const messages = harness.v2Updates.map(({ update }) => update)
         .filter(update => update.sessionUpdate === 'user_message' || update.sessionUpdate === 'agent_message')
       expect(messages).toMatchObject([
-        { sessionUpdate: 'user_message', ...receipt, content: params.prompt },
+        { sessionUpdate: 'user_message', ...receipt, content: [
+          { type: 'text', text: 'retain me\n[resource_link name="reference" uri="file:///fixture.txt"]\n' },
+        ] },
         { sessionUpdate: 'agent_message', content: [{ type: 'text', text: 'committed answer' }] },
       ])
       await harness.dispose()

@@ -77,17 +77,22 @@ function parseKeyedPrompt(value: unknown): PromptRequest & { idempotencyKey: str
     || typeof value.sessionId !== 'string' || !('idempotencyKey' in value) || typeof value.idempotencyKey !== 'string'
     || value.idempotencyKey.length === 0 || Array.from(value.idempotencyKey).length > 255 || !('prompt' in value)
     || !Array.isArray(value.prompt) || value.prompt.length === 0) {
-    throw invalidParams('expected a sessionId, 1–255 character idempotencyKey, and nonempty text prompt')
+    throw invalidParams('expected a sessionId, 1–255 character idempotencyKey, and a nonempty prompt')
   }
   return {
     sessionId: value.sessionId,
     idempotencyKey: value.idempotencyKey,
     prompt: value.prompt.map((block: unknown) => {
-      if (typeof block !== 'object' || block === null || !('type' in block) || block.type !== 'text'
-        || !('text' in block) || typeof block.text !== 'string') {
-        throw invalidParams('the keyed prompt extension accepts text content only')
+      if (typeof block === 'object' && block !== null && 'type' in block) {
+        if (block.type === 'text' && 'text' in block && typeof block.text === 'string') {
+          return { type: 'text', text: block.text }
+        }
+        if (block.type === 'resource_link' && 'name' in block && typeof block.name === 'string'
+          && 'uri' in block && typeof block.uri === 'string') {
+          return { type: 'resource_link', name: block.name, uri: block.uri }
+        }
       }
-      return { type: 'text', text: block.text }
+      throw invalidParams('the ACP v2 preview accepts text and resource links')
     }),
   }
 }
@@ -518,6 +523,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
     .onRequest(v2.methods.agent.initialize, () => ({
       protocolVersion: 2,
       info: { name: 'deepseek-harness-acp', version: '0.0.1' },
+      capabilities: { session: {} },
       _meta: { 'nymph.ai/fabric': { keyedTextPrompts: true } },
     }))
     .onRequest(v2.methods.agent.session.new, ({ params, signal }) => v2Result(async () => {
