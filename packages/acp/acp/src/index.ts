@@ -60,6 +60,7 @@ import { cursorAfter, cursorKey, FABRIC_CURSOR_REPLAY } from './cursors.ts'
 import { V2ToolUpdates } from './updates.ts'
 
 const DEFAULT_SESSION_LIST_PAGE_SIZE = 100
+type PendingV2Approval = { controller: AbortController, signal: AbortSignal }
 
 export const name = 'acp'
 /** Core services required by the standard automation controls. */
@@ -209,6 +210,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
   let v2Client: v2.AgentContext | undefined
   const v2Updates = new Map<SessionId, Promise<void>>()
   const v2Tools = new Map<SessionId, V2ToolUpdates>()
+  const v2Approvals = new Map<SessionId, Map<string, PendingV2Approval>>()
   const signingKey = config.protocolV2 === true && config.cursorSigningKeyFile !== undefined
     ? cursorKey(config.cursorSigningKeyFile)
     : undefined
@@ -352,15 +354,36 @@ export function apply(ctx: Context, config: AcpConfig): void {
       }
       let response
       if (v2Client !== undefined) {
-        await v2Updates.get(record.agent.session.id)
-        const toolCallId = v2Tools.get(record.agent.session.id)?.forApproval(callId)
+        const client = v2Client
+        const id = record.agent.session.id
+        await v2Updates.get(id)
+        const toolCallId = v2Tools.get(id)?.forApproval(callId)
         if (toolCallId === undefined) return 'rejected'
-        response = await v2Client.request(v2.methods.client.session.requestPermission, {
-          sessionId: params.sessionId,
-          title: 'DeepSeek Harness requests permission',
-          subject: { type: 'tool_call', toolCall: { toolCallId } },
-          options: params.options,
-        })
+        const controller = new AbortController()
+        const signal = request.signal === undefined ? controller.signal : AbortSignal.any([request.signal, controller.signal])
+        if (signal.aborted) return 'cancelled'
+        const pending = v2Approvals.get(id) ?? new Map<string, PendingV2Approval>()
+        if (pending.has(toolCallId)) return 'rejected'
+        pending.set(toolCallId, { controller, signal })
+        v2Approvals.set(id, pending)
+        try {
+          await notifyV2(id, { sessionUpdate: 'tool_call_update', toolCallId, capabilities: { cancel: {} } })
+          if (signal.aborted) return 'cancelled'
+          response = await client.request(v2.methods.client.session.requestPermission, {
+            sessionId: id,
+            title: 'DeepSeek Harness requests permission',
+            subject: { type: 'tool_call', toolCall: { toolCallId } },
+            options: params.options,
+          }, { cancellationSignal: signal, stopWaitingOnCancel: true })
+          if (signal.aborted) return 'cancelled'
+        } catch (error: unknown) {
+          if (signal.aborted) return 'cancelled'
+          throw error
+        } finally {
+          pending.delete(toolCallId)
+          if (pending.size === 0) v2Approvals.delete(id)
+          await notifyV2(id, { sessionUpdate: 'tool_call_update', toolCallId, capabilities: null }).catch(() => {})
+        }
       } else {
         response = await conn.request(methods.client.session.requestPermission, params)
       }
@@ -679,6 +702,13 @@ export function apply(ctx: Context, config: AcpConfig): void {
         : { outcome: 'injected', ...receipt }
     }))
     .onNotification(v2.methods.agent.session.cancel, ({ params }) => implementation.cancel(params))
+    .onRequest(v2.methods.agent.toolCall.cancel, ({ params }) => v2Result(async () => {
+      const id = brandString<SessionId>(params.sessionId)
+      const approval = v2Approvals.get(id)?.get(params.toolCallId)
+      if (approval === undefined || approval.signal.aborted) throw invalidParams('this DSH tool call has no pending ACP approval')
+      approval.controller.abort()
+      return {}
+    }))
     .onRequest(v2.methods.agent.session.close, ({ params }) => v2Result(async () => {
       const id = brandString<SessionId>(params.sessionId)
       const response = await implementation.closeSession(params)
