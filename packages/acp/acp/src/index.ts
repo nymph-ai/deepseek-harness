@@ -265,7 +265,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
   const notifyV2 = (sessionId: SessionId, update: v2.SessionUpdate): Promise<void> =>
     enqueueV2(sessionId, () => sendV2(sessionId, update))
 
-  const childControl = config.protocolV2 === true ? new V2ChildControl(ctx, (id) => {
+  const childControl = config.protocolV2 === true ? new V2ChildControl(ctx, persistence, (id) => {
     const record = sessions.get(id)
     return !closed && v2Client !== undefined && record?.isOpen === true ? record.agent : undefined
   }, (parent, send) => { void enqueueV2(parent, send).catch(() => {}) }, sendV2) : undefined
