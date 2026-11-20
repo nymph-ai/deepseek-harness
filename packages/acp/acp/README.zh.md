@@ -60,6 +60,8 @@ v2 预览版同时声明 `_meta.steering.supported` 和 `_meta["nymph.ai/fabric"
 
 配置 `cursorSigningKeyFile` 后，v2 bridge 会在每条保留且未调用工具的助手消息之后公布签名游标。`session/fork` 复制截至该消息的原生事件前缀。使用 `replayFrom: { "type": "_fabric_cursor", "cursorId": "…" }` 可回放已分离会话的后续记录。在末尾恢复时仍会发出 `replay_complete`，但不回放历史。其他锚点类型、无效游标或跨会话游标会返回 `-32602`。
 
+显式 v2 回放会恢复只读的一级子会话关联。选中的本地子会话必须已经结束，且父会话目录和子会话头部都确认其归属。桥接先公布子会话，再回放它自己保存的用户和助手消息，并为它发送独立的 `replay_complete`。子回放不包含继承的分叉历史和运行时生成的委派上下文。如果选中的子会话缺失或归属不匹配，桥接会在回放开始前返回 `dsh_child_history_unavailable`。
+
 生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-acp)是每个受支持字段及其 JSDoc 的穷尽式真源。
 
 ### 启动服务器

@@ -58,6 +58,7 @@ import { retainPromptContent, storedPromptContent } from './prompt-content.ts'
 import { AcpSession, type CreateAcpSessionOptions } from './session.ts'
 import { cursorAfter, cursorKey, FABRIC_CURSOR_REPLAY } from './cursors.ts'
 import { V2ToolUpdates } from './updates.ts'
+import { readChildHistories } from './child-history.ts'
 
 const DEFAULT_SESSION_LIST_PAGE_SIZE = 100
 type PendingV2Approval = { controller: AbortController, signal: AbortSignal }
@@ -232,7 +233,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
   const notifyV2 = (sessionId: SessionId, update: v2.SessionUpdate): Promise<void> =>
     enqueueV2(sessionId, () => sendV2(sessionId, update))
 
-  const readHistory = async (sessionId: SessionId, cwd: string, signal: AbortSignal): Promise<readonly SessionEvent[]> => {
+  const readHistory = async (sessionId: SessionId, cwd: string, signal: AbortSignal) => {
     const header = (await persistence.stat(sessionId, { signal }))?.header
     if (header === undefined || header.origin === 'subagent' || !await sameDirectory(header.cwd, cwd)) {
       throw invalidParams(`session has no retained history in this cwd: ${sessionId}`)
@@ -243,7 +244,8 @@ export function apply(ctx: Context, config: AcpConfig): void {
     }
     const reader = await persistence.open(sessionId, 'read', { signal })
     try {
-      return (await reader.read(0, undefined, { signal })).events
+      const { events } = await reader.read(0, undefined, { signal })
+      return { events, inheritedEventCount: reader.inheritedEventCount }
     } finally {
       await reader.close()
     }
@@ -652,7 +654,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
           || typeof replay.cursorId !== 'string' || !/^dsh-cursor:[A-Za-z0-9_-]{43}$/.test(replay.cursorId)) {
           throw invalidParams('unsupported or malformed DSH replay cursor')
         }
-        const events = await readHistory(sessionId, params.cwd, signal)
+        const { events } = await readHistory(sessionId, params.cwd, signal)
         resolveCursor(sessionId, events, replay.cursorId)
         replayCursorId = replay.cursorId
       }
@@ -660,10 +662,27 @@ export function apply(ctx: Context, config: AcpConfig): void {
       try {
         await enqueueV2(sessionId, async () => {
           if (replay != null) {
-            const events = await readHistory(sessionId, params.cwd, signal)
+            const { events, inheritedEventCount } = await readHistory(sessionId, params.cwd, signal)
             const start = replayCursorId === undefined ? 0 : resolveCursor(sessionId, events, replayCursorId) + 1
+            const selected = events.slice(start)
+            const children = await readChildHistories(ctx, persistence, sessionId, inheritedEventCount, selected, signal)
             const tools = new V2ToolUpdates()
-            for (const event of events.slice(start)) {
+            for (const event of selected) {
+              const child = children.get(event.seq)
+              if (child !== undefined) {
+                await sendV2(sessionId, {
+                  sessionUpdate: 'subagent_update',
+                  sessionId: child.header.id,
+                  ...child.label === undefined ? {} : { title: child.label },
+                  ...child.header.cwd === undefined ? {} : { cwd: child.header.cwd },
+                })
+                for (const childEvent of child.events) {
+                  const update = v2Message(childEvent)
+                  if (update !== undefined) await sendV2(child.header.id, update)
+                }
+                await sendV2(child.header.id, { sessionUpdate: 'replay_complete' })
+                continue
+              }
               const update = v2Message(event)
               if (update === undefined) {
                 const tool = tools.observe(ctx, event)
@@ -732,7 +751,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
         throw invalidParams('this ACP v2 preview accepts a primary cwd only')
       }
       const parent = brandString<SessionId>(params.sessionId)
-      const events = await readHistory(parent, params.cwd, signal)
+      const { events } = await readHistory(parent, params.cwd, signal)
       const boundary = params.cursorId == null ? events.at(-1)?.seq : resolveCursor(parent, events, params.cursorId)
       signal.throwIfAborted()
       const { sessionId, configOptions } = await implementation.newSession({ cwd: params.cwd, mcpServers: [] }, signal, {

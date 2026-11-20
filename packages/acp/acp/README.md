@@ -60,6 +60,8 @@ The v2 preview also advertises `_meta.steering.supported` and `_meta["nymph.ai/f
 
 With `cursorSigningKeyFile`, the v2 bridge announces a signed cursor after each retained tool-free assistant message. `session/fork` copies the native event prefix through that message. To replay the suffix of a detached session, use `replayFrom: { "type": "_fabric_cursor", "cursorId": "…" }`. Resuming at the tip emits `replay_complete` with no history. Other anchor types and invalid or cross-session cursor IDs return `-32602`.
 
+An explicit v2 replay restores read-only first-level associations for selected, settled local children that the parent catalog and child header both identify. The bridge announces each child, replays its own retained user and assistant messages, and sends that child its own `replay_complete`. Inherited fork history and runtime-generated delegation context stay out of the child transcript. A missing or mismatched selected child returns `dsh_child_history_unavailable` before replay begins.
+
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-acp) is the exhaustive source for every accepted field and its JSDoc.
 
 ### Start a server
