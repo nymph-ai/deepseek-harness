@@ -34,8 +34,11 @@ function oneToolCall(): StreamChunk[] {
   ]
 }
 
-function makeV2Harness(persistenceRoot: string, script: StreamChunk[][] = []): Promise<BridgeHarness> {
-  return makeBridgeHarness({ script, persistenceRoot, config: { protocolV2: true }, connectV2: true })
+function makeV2Harness(persistenceRoot: string, script: StreamChunk[][] = [], cursors = false): Promise<BridgeHarness> {
+  return makeBridgeHarness({
+    script, persistenceRoot, connectV2: true,
+    config: { protocolV2: true, ...cursors ? { cursorSigningKeyFile: join(persistenceRoot, 'cursor-key') } : {} },
+  })
 }
 
 describe('automation-only ACP bridge', () => {
@@ -213,6 +216,90 @@ describe('automation-only ACP bridge', () => {
       await harness?.dispose()
       harness = undefined
       await rm(persistenceRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('replays and forks an exact retained tool-free assistant boundary without model calls', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-acp-cursors-'))
+    const cwd = process.cwd()
+    const m = v2.methods.agent
+    const initialize = (client: v2.ClientContext) => client.request(m.initialize, {
+      protocolVersion: 2, info: { name: 'cursor test', version: '0' },
+    })
+    try {
+      harness = await makeV2Harness(dir, [textResponse('first answer'), textResponse('second answer')], true)
+      const client = harness.v2Client!
+      await expect(initialize(client)).resolves.toMatchObject({
+        capabilities: { session: { fork: {} } },
+        _meta: { 'nymph.ai/fabric': { replayFromCursor: '_fabric_cursor' } },
+      })
+      const { sessionId } = await client.request(m.session.new, { cwd })
+      const id = brandString<SessionId>(sessionId)
+      const updates = () => harness!.v2Updates.filter(item => item.sessionId === sessionId).map(item => item.update)
+      for (const [index, text] of ['first prompt', 'second prompt'].entries()) {
+        await client.request(m.session.prompt, { sessionId, prompt: [{ type: 'text', text }] })
+        await vi.waitFor(() => {
+          expect(updates().filter(u => u.sessionUpdate === 'state_update' && u.state === 'idle')).toHaveLength(index + 1)
+        })
+      }
+      type Cursor = Extract<v2.SessionUpdate, { sessionUpdate: 'cursor_update' }>
+      type Message = Extract<v2.SessionUpdate, { sessionUpdate: 'user_message' | 'agent_message' }>
+      const cursors = updates().filter((u): u is Cursor => u.sessionUpdate === 'cursor_update')
+      const history = updates().filter((u): u is Message => u.sessionUpdate === 'user_message' || u.sessionUpdate === 'agent_message')
+      expect(cursors).toHaveLength(2)
+      expect(cursors[0]).toMatchObject({
+        anchor: { type: 'agent_message', messageId: history[1]?.messageId, position: 'after' },
+        capabilities: { fork: {} },
+      })
+      const firstCursor = cursors[0]!.cursorId
+      const { sessionId: forked } = await client.request(m.session.fork, { sessionId, cwd, cursorId: firstCursor })
+      const parent = await harness.ctx.sessionPersistence.open(id, 'read')
+      const child = await harness.ctx.sessionPersistence.open(brandString<SessionId>(forked), 'read')
+      try {
+        const { events } = await parent.read()
+        const firstAnswer = events.find(event => event.type === 'assistant/message')
+        expect(firstAnswer).toBeDefined()
+        expect(child.inheritedEventCount).toBe(firstAnswer!.seq + 1)
+        const { events: inherited } = await child.read()
+        expect(inherited.slice(0, child.inheritedEventCount)).toEqual(events.slice(0, firstAnswer!.seq + 1))
+        expect(inherited.slice(child.inheritedEventCount).map(event => event.type)).toEqual([
+          'session/end-seed', 'step/end', 'turn/end',
+        ])
+      } finally {
+        await child.close()
+        await parent.close()
+      }
+      expect(harness.adapter.requests).toHaveLength(2)
+      await harness.dispose()
+
+      harness = await makeV2Harness(dir, [], true)
+      const cold = harness.v2Client!
+      await initialize(cold)
+      await expect(cold.request(m.session.resume, {
+        sessionId: forked, cwd, replayFrom: { type: '_fabric_cursor', cursorId: firstCursor },
+      })).rejects.toMatchObject({ code: -32602 })
+      expect(harness.v2Updates).toEqual([])
+      const arrived = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'arrived before activation' }] })
+      const resume = harness.ctx.agents.resume.bind(harness.ctx.agents)
+      vi.spyOn(harness.ctx.agents, 'resume').mockImplementationOnce(async (options) => {
+        const handle = await resume(options)
+        handle.agent.session.append('user/message', arrived, { surfaceOp: 'append' })
+        return handle
+      })
+      await cold.request(m.session.resume, { sessionId, cwd, replayFrom: { type: '_fabric_cursor', cursorId: firstCursor } })
+      expect(updates()).toEqual([
+        ...history.slice(2), cursors[1],
+        { sessionUpdate: 'user_message', messageId: arrived.id, content: arrived.content }, { sessionUpdate: 'replay_complete' },
+        { sessionUpdate: 'state_update', state: 'idle', stopReason: null },
+      ])
+      await cold.request(m.session.resume, { sessionId: forked, cwd, replayFrom: { type: 'start' } })
+      const inherited = harness.v2Updates.filter(item => item.sessionId === forked).map(item => item.update)
+      expect(inherited.filter(u => u.sessionUpdate === 'user_message' || u.sessionUpdate === 'agent_message')).toEqual(history.slice(0, 2))
+      expect(harness.adapter.requests).toHaveLength(0)
+    } finally {
+      await harness?.dispose()
+      harness = undefined
+      await rm(dir, { recursive: true, force: true })
     }
   })
 

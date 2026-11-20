@@ -12,7 +12,7 @@ import {
   type SessionNotification,
   type StopReason,
 } from '@agentclientprotocol/sdk'
-import type { Agent, AgentHandle, AgentOptions, AgentStatus } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle, AgentOptions, AgentStatus, CreateAgentOptions } from '@deepseek-ai/dsh-agent'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import { createUserMessage, errorChain, type MessageId, type UserMessage } from '@deepseek-ai/dsh-llm'
@@ -44,6 +44,11 @@ interface AcpSessionBuildOptions {
 /** Fresh ACP session construction inputs. */
 export interface CreateAcpSessionOptions extends AcpSessionBuildOptions {
   sessionId: SessionId
+  /** Exact native inherited history and source reference for a fork. */
+  fork?: {
+    seed: readonly SessionEvent[]
+    parentSource: NonNullable<CreateAgentOptions['parentSource']>
+  }
 }
 
 /** Persisted ACP session construction inputs. */
@@ -131,7 +136,12 @@ export class AcpSession {
     const cwd = fs === undefined ? options.cwd : fs.processPath(await fs.resolve(options.cwd, { signal: options.signal }))
     const handle = await ctx.agents.create({
       sessionId: options.sessionId,
-      meta: { cwd },
+      meta: { cwd, ...options.fork === undefined ? {} : { isSeeded: true, parentSession: options.fork.parentSource.sessionId } },
+      ...options.fork === undefined ? {} : {
+        seed: options.fork.seed,
+        parentSource: options.fork.parentSource,
+        inheritedEventCount: options.fork.parentSource.endSeq,
+      },
       agentOptions: options.agentOptions,
       signal: options.signal,
       setup: agentCtx => composeAgent(agentCtx, options),

@@ -47,14 +47,15 @@ import {
   type Stream,
 } from '@agentclientprotocol/sdk'
 import * as v2 from 'acp-v2-sdk/experimental/v2/unstable'
-import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
+import { buildForkSeed, SessionLogOffset, type SessionEvent, type SessionId, type SessionSeq } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 // Side-effect type import: declaration-merges the approval waterfall answered below.
 import type {} from '@deepseek-ai/dsh-user-approval'
 import { supportsAcpImagePrompts } from './content.ts'
 import { AcpMcpConfigError } from './mcp.ts'
 import { AcpModelConfigError } from './model-control.ts'
-import { AcpSession } from './session.ts'
+import { AcpSession, type CreateAcpSessionOptions } from './session.ts'
+import { cursorAfter, cursorKey, FABRIC_CURSOR_REPLAY } from './cursors.ts'
 
 const DEFAULT_SESSION_LIST_PAGE_SIZE = 100
 
@@ -173,6 +174,8 @@ export interface AcpConfig {
   sessionListPageSize?: number
   /** Opt in to the text-focused ACP v2 preview alongside ACP v1. */
   protocolV2?: boolean
+  /** Absolute persistent signing key path to enable native ACP v2 cursors. */
+  cursorSigningKeyFile?: string
   /** Runtime-only transport override; production uses stdio. */
   stream?: Stream
 }
@@ -182,6 +185,7 @@ export const Config: Schema<AcpConfig> = Schema.object({
   model: Schema.string(),
   sessionListPageSize: Schema.natural().min(1).default(DEFAULT_SESSION_LIST_PAGE_SIZE),
   protocolV2: Schema.boolean().default(false),
+  cursorSigningKeyFile: Schema.string(),
 })
 
 /**
@@ -201,14 +205,51 @@ export function apply(ctx: Context, config: AcpConfig): void {
   let imagePromptEnabled = false
   let v2Client: v2.AgentContext | undefined
   const v2Updates = new Map<SessionId, Promise<void>>()
+  const signingKey = config.protocolV2 === true && config.cursorSigningKeyFile !== undefined
+    ? cursorKey(config.cursorSigningKeyFile)
+    : undefined
 
-  const notifyV2 = (sessionId: SessionId, update: v2.SessionUpdate): Promise<void> => {
+  const sendV2 = async (sessionId: SessionId, update: v2.SessionUpdate): Promise<void> => {
+    await v2Client?.notify(v2.methods.client.session.update, { sessionId, update })
+  }
+
+
+  const enqueueV2 = (sessionId: SessionId, send: () => Promise<void>): Promise<void> => {
     const tail = v2Updates.get(sessionId) ?? Promise.resolve()
-    const sent = tail.then(() => v2Client?.notify(v2.methods.client.session.update, { sessionId, update }))
+    const sent = tail.then(send)
     v2Updates.set(sessionId, sent.catch((error: unknown) => {
       logger.warn(`acp v2: session/update failed: ${String(error)}`)
     }))
     return sent
+  }
+
+  const notifyV2 = (sessionId: SessionId, update: v2.SessionUpdate): Promise<void> =>
+    enqueueV2(sessionId, () => sendV2(sessionId, update))
+
+  const readHistory = async (sessionId: SessionId, cwd: string, signal: AbortSignal): Promise<readonly SessionEvent[]> => {
+    const header = (await persistence.stat(sessionId, { signal }))?.header
+    if (header === undefined || header.origin === 'subagent' || !await sameDirectory(header.cwd, cwd)) {
+      throw invalidParams(`session has no retained history in this cwd: ${sessionId}`)
+    }
+    const live = sessions.get(sessionId)?.agent.session
+    if (live !== undefined && !await ctx.sessions.flush(live)) {
+      throw internalError('no session durability listener is available')
+    }
+    const reader = await persistence.open(sessionId, 'read', { signal })
+    try {
+      return (await reader.read(0, undefined, { signal })).events
+    } finally {
+      await reader.close()
+    }
+  }
+
+  const resolveCursor = (sessionId: SessionId, events: readonly SessionEvent[], id: string): SessionSeq => {
+    if (signingKey !== undefined) {
+      for (const event of events) {
+        if (cursorAfter(signingKey, sessionId, event)?.cursorId === id) return event.seq
+      }
+    }
+    throw invalidParams('unrecognized or stale cursor for this DSH session')
   }
 
   /** Return the bridge-owned record for an agent, rejecting same-id impostors. */
@@ -261,7 +302,12 @@ export function apply(ctx: Context, config: AcpConfig): void {
         void notifyV2(session.header.id, { sessionUpdate: 'state_update', state: 'running' }).catch(() => {})
       }
       const update = v2Message(event)
-      if (update !== undefined) void notifyV2(session.header.id, update).catch(() => {})
+      if (update === undefined) return
+      void enqueueV2(session.id, async () => {
+        await sendV2(session.id, update)
+        const cursor = signingKey === undefined ? undefined : cursorAfter(signingKey, session.id, event)
+        if (cursor !== undefined && await ctx.sessions.flush(session)) await sendV2(session.id, cursor)
+      }).catch(() => {})
     }
   })
 
@@ -333,7 +379,9 @@ export function apply(ctx: Context, config: AcpConfig): void {
       return Promise.resolve()
     },
 
-    async newSession(params: NewSessionRequest, signal: AbortSignal): Promise<NewSessionResponse> {
+    async newSession(
+      params: NewSessionRequest, signal: AbortSignal, fork?: CreateAcpSessionOptions['fork'],
+    ): Promise<NewSessionResponse> {
       assertOpen()
       validateWorkspaceParams(params)
       const sessionId = brandString<SessionId>(randomUUID())
@@ -348,6 +396,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
           cwd: params.cwd,
           mcpServers: params.mcpServers,
           agentOptions: agentOptions(config),
+          ...fork === undefined ? {} : { fork },
           signal,
           notify,
         })
@@ -536,9 +585,13 @@ export function apply(ctx: Context, config: AcpConfig): void {
     .onRequest(v2.methods.agent.initialize, () => ({
       protocolVersion: 2,
       info: { name: 'deepseek-harness-acp', version: '0.0.1' },
-      capabilities: { session: {} },
+      capabilities: { session: signingKey === undefined ? {} : { fork: {} } },
       _meta: {
-        'nymph.ai/fabric': { keyedTextPrompts: true, keyedTextSteering: true },
+        'nymph.ai/fabric': {
+          keyedTextPrompts: true,
+          keyedTextSteering: true,
+          ...signingKey === undefined ? {} : { replayFromCursor: FABRIC_CURSOR_REPLAY },
+        },
         steering: { supported: true },
       },
     }))
@@ -555,25 +608,35 @@ export function apply(ctx: Context, config: AcpConfig): void {
       if (params.additionalDirectories?.length || params.mcpServers?.length || params.systemPrompt != null) {
         throw invalidParams('this ACP v2 preview accepts a primary cwd only')
       }
-      if (params.replayFrom != null && params.replayFrom.type !== 'start') {
-        throw invalidParams('this ACP v2 preview supports replay from the start only')
-      }
       const sessionId = brandString<SessionId>(params.sessionId)
+      let replayCursorId: string | undefined
+      const replay = params.replayFrom
+      if (replay != null && replay.type !== 'start') {
+        if (signingKey === undefined || replay.type !== FABRIC_CURSOR_REPLAY
+          || typeof replay.cursorId !== 'string' || !/^dsh-cursor:[A-Za-z0-9_-]{43}$/.test(replay.cursorId)) {
+          throw invalidParams('unsupported or malformed DSH replay cursor')
+        }
+        const events = await readHistory(sessionId, params.cwd, signal)
+        resolveCursor(sessionId, events, replay.cursorId)
+        replayCursorId = replay.cursorId
+      }
       const { configOptions } = await implementation.resumeSession({ sessionId, cwd: params.cwd, mcpServers: [] }, signal)
       try {
-        if (params.replayFrom != null) {
-          const reader = await persistence.open(sessionId, 'read')
-          try {
-            for (const event of (await reader.read()).events) {
+        await enqueueV2(sessionId, async () => {
+          if (replay != null) {
+            const events = await readHistory(sessionId, params.cwd, signal)
+            const start = replayCursorId === undefined ? 0 : resolveCursor(sessionId, events, replayCursorId) + 1
+            for (const event of events.slice(start)) {
               const update = v2Message(event)
-              if (update !== undefined) await notifyV2(sessionId, update)
+              if (update === undefined) continue
+              await sendV2(sessionId, update)
+              const cursor = signingKey === undefined ? undefined : cursorAfter(signingKey, sessionId, event)
+              if (cursor !== undefined) await sendV2(sessionId, cursor)
             }
-          } finally {
-            await reader.close()
+            await sendV2(sessionId, { sessionUpdate: 'replay_complete' })
           }
-          await notifyV2(sessionId, { sessionUpdate: 'replay_complete' })
-        }
-        await notifyV2(sessionId, { sessionUpdate: 'state_update', state: 'idle', stopReason: null })
+          await sendV2(sessionId, { sessionUpdate: 'state_update', state: 'idle', stopReason: null })
+        })
       } catch (error: unknown) {
         await implementation.closeSession({ sessionId })
         v2Updates.delete(sessionId)
@@ -611,8 +674,25 @@ export function apply(ctx: Context, config: AcpConfig): void {
       }, signal)
       return { configOptions: v2Config(configOptions) }
     }))
+  const v2WithCursors = signingKey === undefined
+    ? v2App
+    : v2App.onRequest(v2.methods.agent.session.fork, ({ params, signal }) => v2Result(async () => {
+      if (!isAbsolute(params.cwd) || params.additionalDirectories?.length || params.mcpServers?.length
+        || params.configOptions?.length || params.systemPrompt != null) {
+        throw invalidParams('this ACP v2 preview accepts a primary cwd only')
+      }
+      const parent = brandString<SessionId>(params.sessionId)
+      const events = await readHistory(parent, params.cwd, signal)
+      const boundary = params.cursorId == null ? events.at(-1)?.seq : resolveCursor(parent, events, params.cursorId)
+      signal.throwIfAborted()
+      const { sessionId, configOptions } = await implementation.newSession({ cwd: params.cwd, mcpServers: [] }, signal, {
+        seed: boundary === undefined ? [] : buildForkSeed(events, boundary),
+        parentSource: { sessionId: parent, endSeq: SessionLogOffset(boundary === undefined ? 0 : boundary + 1) },
+      })
+      return { sessionId, configOptions: v2Config(configOptions) }
+    }))
   const connection = config.protocolV2 === true
-    ? v2.agentProtocolRouter().withV1({ connect: connectV1 }).withV2(v2App).connect(stream)
+    ? v2.agentProtocolRouter().withV1({ connect: connectV1 }).withV2(v2WithCursors).connect(stream)
     : connectV1(stream)
 
   let quiescing: Promise<void> | undefined

@@ -48,10 +48,13 @@ Every session the server creates uses the provider and model configured here. Bo
 | `model` | — | Model for every session's agent |
 | `sessionListPageSize` | `100` | Maximum summaries returned in one `session/list` page |
 | `protocolV2` | `false` | Enable negotiation of the text-focused ACP v2 preview alongside ACP v1 |
+| `cursorSigningKeyFile` | — | Absolute path in persistent storage to enable native ACP v2 cursors |
 
-The v2 preview accepts text and resource links, which are rendered as native text without dereferencing the URI. It acknowledges keyed prompts after native session persistence and returns the same message ID on retry after restart. Its initialize response advertises `_meta["nymph.ai/fabric"].keyedTextPrompts`. `session/resume` with `replayFrom: { "type": "start" }` replays the text conversation. Cursor replay, tool history, image prompts, client MCP setup, and forks are outside the v2 preview.
+The v2 preview accepts text and resource links, which are rendered as native text without dereferencing the URI. It acknowledges keyed prompts after native session persistence and returns the same message ID on retry after restart. Its initialize response advertises `_meta["nymph.ai/fabric"].keyedTextPrompts`. `session/resume` with `replayFrom: { "type": "start" }` replays the text conversation. Tool history, image prompts, and client MCP setup are outside the v2 preview.
 
 The v2 preview also advertises `_meta.steering.supported` and `_meta["nymph.ai/fabric"].keyedTextSteering`. Send text or resource links via `_session/steering` with `_meta.steering.idempotencyKey` and `idleBehavior: "promptRequired"`. The existing turn owns the input and the bridge replies after its native user message is durable. An idle session returns `promptRequired` without starting work, and a retained receipt is reusable after restart.
+
+With `cursorSigningKeyFile`, the v2 bridge announces a signed cursor after each retained tool-free assistant message. `session/fork` copies the native event prefix through that message. To replay the suffix of a detached session, use `replayFrom: { "type": "_fabric_cursor", "cursorId": "…" }`. Resuming at the tip emits `replay_complete` with no history. Other anchor types and invalid or cross-session cursor IDs return `-32602`.
 
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-acp) is the exhaustive source for every accepted field and its JSDoc.
 
