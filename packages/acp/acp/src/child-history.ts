@@ -1,4 +1,4 @@
-/** Validate direct child ownership against the native parent catalog and child journal. */
+/** Validate each selected child against its native creator catalog and journal. */
 
 import type { Context } from '@deepseek-ai/cordis'
 import { RequestError } from '@agentclientprotocol/sdk'
@@ -6,10 +6,11 @@ import { brandString } from '@deepseek-ai/dsh-brand'
 import type { SessionEvent, SessionHeader, SessionId, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 
-interface ChildHistory {
+export interface ChildHistory {
   readonly header: SessionHeader
   readonly label: string | undefined
   readonly events: readonly SessionEvent[]
+  readonly children: ReadonlyMap<SessionSeq, ChildHistory>
 }
 
 function unavailable(): RequestError {
@@ -42,7 +43,7 @@ function localCatalogChild(event: SessionEvent) {
  * @param inheritedEventCount - exact inherited cut from the root read handle.
  * @param selected - the root's retained event suffix requested by the client.
  * @param signal - request cancellation propagated to read-only handles.
- * @returns validated first-level, settled child history by own catalog occurrence.
+ * @returns validated settled child trees by own catalog occurrence.
  */
 export async function readChildHistories(
   ctx: Context,
@@ -52,25 +53,48 @@ export async function readChildHistories(
   selected: readonly SessionEvent[],
   signal: AbortSignal,
 ): Promise<ReadonlyMap<SessionSeq, ChildHistory>> {
+  const seen = new Set<SessionId>([parentId])
+  const histories = await collectChildHistories(ctx, persistence, parentId, inheritedEventCount, selected, signal, seen)
+  for (const child of seen) {
+    if (child !== parentId && ctx.sessions.get(child) !== undefined) throw unavailable()
+  }
+  return histories
+}
+
+async function collectChildHistories(
+  ctx: Context,
+  persistence: SessionPersistence,
+  parentId: SessionId,
+  inheritedEventCount: SessionLogOffset,
+  selected: readonly SessionEvent[],
+  signal: AbortSignal,
+  seen: Set<SessionId>,
+): Promise<ReadonlyMap<SessionSeq, ChildHistory>> {
   const histories = new Map<SessionSeq, ChildHistory>()
-  const seen = new Set<SessionId>()
   for (const event of selected) {
     if (event.seq < inheritedEventCount) continue
     const entry = localCatalogChild(event)
     if (entry === undefined) continue
     const { childId, childCreatedAt, label } = entry
-    if (childId === parentId || seen.has(childId) || ctx.sessions.get(childId) !== undefined) throw unavailable()
+    if (seen.has(childId) || ctx.sessions.get(childId) !== undefined) throw unavailable()
     seen.add(childId)
     try {
-      await using reader = await persistence.open(childId, 'read', { signal })
-      const { header } = reader
-      if (header.id !== childId || header.origin !== 'subagent' || header.parentSession !== parentId
-        || header.createdAt !== childCreatedAt) throw unavailable()
-      const { events } = await reader.read(reader.inheritedEventCount, undefined, { signal })
+      let header: SessionHeader
+      let events: readonly SessionEvent[]
+      let childInherited: SessionLogOffset
+      {
+        await using reader = await persistence.open(childId, 'read', { signal })
+        header = reader.header
+        childInherited = reader.inheritedEventCount
+        if (header.id !== childId || header.origin !== 'subagent' || header.parentSession !== parentId
+          || header.createdAt !== childCreatedAt) throw unavailable()
+        events = (await reader.read(childInherited, undefined, { signal })).events
+      }
       const phase = events.findLast(entry => entry.type === 'turn/start' || entry.type === 'turn/end')
       if (phase?.type !== 'turn/end' || phase.data.reason.kind === 'forked' || phase.data.reason.kind === 'interrupted'
         || ctx.sessions.get(childId) !== undefined) throw unavailable()
-      histories.set(event.seq, { header, label, events })
+      const children = await collectChildHistories(ctx, persistence, childId, childInherited, events, signal, seen)
+      histories.set(event.seq, { header, label, events, children })
     } catch (error: unknown) {
       signal.throwIfAborted()
       if (error instanceof RequestError) throw error

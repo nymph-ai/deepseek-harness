@@ -59,7 +59,7 @@ import { AcpSession, type CreateAcpSessionOptions } from './session.ts'
 import { cursorAfter, cursorKey, FABRIC_CURSOR_REPLAY } from './cursors.ts'
 import { V2ToolUpdates } from './updates.ts'
 import { V2ChildControl } from './child-control.ts'
-import { readChildHistories } from './child-history.ts'
+import { readChildHistories, type ChildHistory } from './child-history.ts'
 
 const DEFAULT_SESSION_LIST_PAGE_SIZE = 100
 type PendingV2Approval = { controller: AbortController; signal: AbortSignal }
@@ -230,6 +230,26 @@ export function apply(ctx: Context, config: AcpConfig): void {
 
   const sendV2 = async (sessionId: SessionId, update: v2.SessionUpdate): Promise<void> => {
     await v2Client?.notify(v2.methods.client.session.update, { sessionId, update })
+  }
+
+  const sendChildHistory = async (parentId: SessionId, child: ChildHistory): Promise<void> => {
+    const { id, cwd } = child.header
+    await sendV2(parentId, {
+      sessionUpdate: 'subagent_update',
+      sessionId: id,
+      ...child.label === undefined ? {} : { title: child.label },
+      ...cwd === undefined ? {} : { cwd },
+    })
+    for (const event of child.events) {
+      const nested = child.children.get(event.seq)
+      if (nested !== undefined) {
+        await sendChildHistory(id, nested)
+        continue
+      }
+      const update = v2Message(event)
+      if (update !== undefined) await sendV2(id, update)
+    }
+    await sendV2(id, { sessionUpdate: 'replay_complete' })
   }
 
 
@@ -692,17 +712,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
             for (const event of selected) {
               const child = children.get(event.seq)
               if (child !== undefined) {
-                await sendV2(sessionId, {
-                  sessionUpdate: 'subagent_update',
-                  sessionId: child.header.id,
-                  ...child.label === undefined ? {} : { title: child.label },
-                  ...child.header.cwd === undefined ? {} : { cwd: child.header.cwd },
-                })
-                for (const childEvent of child.events) {
-                  const update = v2Message(childEvent)
-                  if (update !== undefined) await sendV2(child.header.id, update)
-                }
-                await sendV2(child.header.id, { sessionUpdate: 'replay_complete' })
+                await sendChildHistory(sessionId, child)
                 continue
               }
               const update = v2Message(event)
