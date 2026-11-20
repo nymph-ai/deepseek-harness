@@ -50,7 +50,7 @@ kind: "package-reference"
 | `protocolV2` | `false` | 在 ACP v1 之外启用面向文本的 ACP v2 预览版协商 |
 | `cursorSigningKeyFile` | — | 启用原生 ACP v2 游标的持久存储绝对路径 |
 
-v2 预览版接受文本和资源链接。含资源链接的提示词会在原生用户消息中同时保存原有顺序的类型化内容块和发给模型的文本。模型文本将链接保留为 URI 引用。使用相同幂等键重试时，只有请求中的类型化内容块与存档完全匹配，桥接才会返回原消息 ID。旧记录仅凭已存文本仍可确认文本重试。如果存档只有类型化提示词的入队记录，尚未提交用户消息，则返回 `dsh_prompt_dispatch_unknown`，并阻止重复入队。初始化响应声明 `_meta["nymph.ai/fabric"].keyedTextPrompts`。为 `session/resume` 传入 `replayFrom: { "type": "start" }` 会回放对话和工具更新。图像提示词和客户端 MCP 配置不属于本次 v2 预览范围。
+v2 预览版接受文本和资源链接。含资源链接的提示词会在原生用户消息中同时保存原有顺序的类型化内容块和发给模型的文本。模型文本将链接保留为 URI 引用。使用相同幂等键重试时，只有请求中的类型化内容块与存档完全匹配，桥接才会返回原消息 ID。旧记录仅凭已存文本仍可确认文本重试。如果存档只有类型化提示词的入队记录，尚未提交用户消息，则返回 `dsh_prompt_dispatch_unknown`，并阻止重复入队。初始化响应在 `_meta["nymph.ai/fabric"]` 下声明 `keyedTextPrompts` 和 `keyedResourceLinkPrompts`。为 `session/resume` 传入 `replayFrom: { "type": "start" }` 会回放对话和工具更新。图像提示词和客户端 MCP 配置不属于本次 v2 预览范围。
 
 已记录的工具调用显示为等待中。关联的结果提供成功、失败或取消状态，以及已记录的输出。ACP 工具 ID 对应原生调用序号，提供方的工具 ID 记录在 `_meta["nymph.ai/fabric"].nativeToolCallId` 中。实时更新和历史回放使用相同的 ID。缺少关联结果的工具记录保留等待状态。结果附件缺失时，仍会提供状态和可用输出，并在元数据中设置 `toolOutputPartial`。
 
