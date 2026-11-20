@@ -1,13 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
 import * as v2 from 'acp-v2-sdk/experimental/v2/unstable'
+import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AttachmentError } from '@deepseek-ai/dsh-attachment'
 import LocalFileSystem from '@deepseek-ai/dsh-fs-local'
-import { createUserMessage, type ToolCallId, type StreamChunk } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, type MessageId, type ToolCallId, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import { SESSION_FORMAT_VERSION, type SessionId, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { SessionHeader } from '@deepseek-ai/dsh-session'
 import { brandString } from '@deepseek-ai/dsh-brand'
@@ -96,7 +97,8 @@ describe('automation-only ACP bridge', () => {
       const { sessionId } = await client.request(m.session.new, { cwd })
       const params = { sessionId, idempotencyKey: 'keyed', prompt: [
         { type: 'text' as const, text: 'retain me' },
-        { type: 'resource_link' as const, name: 'reference', uri: 'file:///fixture.txt' },
+        { type: 'resource_link' as const, name: 'reference', uri: 'file:///fixture.txt', title: 'original',
+          _meta: { example: { frozen: true } } },
       ] }
       const receipt = await client.request(m.session.prompt, params)
       await expect(client.request(m.session.prompt, params)).resolves.toEqual(receipt)
@@ -104,6 +106,14 @@ describe('automation-only ACP bridge', () => {
         sessionId, update: { sessionUpdate: 'state_update', state: 'idle', stopReason: 'end_turn' },
       }) })
       const session = harness.ctx.agents.get(brandString<SessionId>(sessionId))!.session
+      const native = session.snapshotEvents().find(event => event.type === 'user/message' && event.data.id === receipt.messageId)
+      if (native?.type !== 'user/message' || native.data.clientContent === undefined) throw new Error('expected native typed input')
+      expect(JSON.parse(native.data.clientContent.json)).toEqual(params.prompt)
+      const unresolved = { ...params, idempotencyKey: 'interrupted-key' }
+      const hash = createHash('sha256').update(JSON.stringify([sessionId, unresolved.idempotencyKey])).digest('hex')
+      const incomplete = { ...native.data, id: brandString<MessageId>(`acp-prompt-v2:${hash}`) }
+      session.append('agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [incomplete] })
+      session.append('agent/inbox/spliced', { target: 'next-turn', start: 0, removedCount: 1, inserted: [], outcome: 'canceled' })
       session.append('user/message', createUserMessage({
         source: { kind: 'system-prompt' },
         content: [{ type: 'text', text: 'Internal model context' }],
@@ -112,9 +122,7 @@ describe('automation-only ACP bridge', () => {
       const messages = harness.v2Updates.map(({ update }) => update)
         .filter(update => update.sessionUpdate === 'user_message' || update.sessionUpdate === 'agent_message')
       expect(messages).toMatchObject([
-        { sessionUpdate: 'user_message', ...receipt, content: [
-          { type: 'text', text: 'retain me\n[resource_link name="reference" uri="file:///fixture.txt"]\n' },
-        ] },
+        { sessionUpdate: 'user_message', ...receipt, content: params.prompt },
         { sessionUpdate: 'agent_message', content: [{ type: 'text', text: 'committed answer' }] },
       ])
       await harness.dispose()
@@ -127,6 +135,11 @@ describe('automation-only ACP bridge', () => {
         ...messages, { sessionUpdate: 'replay_complete' }, { sessionUpdate: 'state_update', state: 'idle', stopReason: null },
       ])
       await expect(reopened.request(m.session.prompt, params)).resolves.toEqual(receipt)
+      await expect(reopened.request(m.session.prompt, { ...params, prompt: [...params.prompt].reverse() }))
+        .rejects.toMatchObject({ code: -32602 })
+      await expect(reopened.request(m.session.prompt, unresolved)).rejects.toMatchObject({
+        code: -32000, data: { kind: 'dsh_prompt_dispatch_unknown' },
+      })
       expect(harness.adapter.requests).toHaveLength(0)
     } finally {
       await harness?.dispose()

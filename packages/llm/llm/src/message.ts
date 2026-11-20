@@ -160,6 +160,11 @@ export interface DeveloperMessage extends MessageBase {
 /** A user-role specialization of the shared message representation. */
 export interface UserMessage extends MessageBase {
   readonly role: 'user'
+  /** Original client content when the transport's typed blocks require a separate model projection. */
+  readonly clientContent?: {
+    readonly format: string
+    readonly json: string
+  }
 }
 
 /** A model-produced assistant specialization of the shared message representation. */
