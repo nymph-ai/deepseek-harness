@@ -187,6 +187,11 @@ export class AcpSession {
     return this.agent.session === session
   }
 
+  /** Whether this root still admits child control. */
+  get isOpen(): boolean {
+    return this.closing === undefined
+  }
+
   /**
    * Return the complete standard model configuration state.
    * @param signal - optional request cancellation.

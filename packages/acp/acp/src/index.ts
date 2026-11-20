@@ -58,10 +58,11 @@ import { retainPromptContent, storedPromptContent } from './prompt-content.ts'
 import { AcpSession, type CreateAcpSessionOptions } from './session.ts'
 import { cursorAfter, cursorKey, FABRIC_CURSOR_REPLAY } from './cursors.ts'
 import { V2ToolUpdates } from './updates.ts'
+import { V2ChildControl } from './child-control.ts'
 import { readChildHistories } from './child-history.ts'
 
 const DEFAULT_SESSION_LIST_PAGE_SIZE = 100
-type PendingV2Approval = { controller: AbortController, signal: AbortSignal }
+type PendingV2Approval = { controller: AbortController; signal: AbortSignal }
 
 export const name = 'acp'
 /** Core services required by the standard automation controls. */
@@ -243,6 +244,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
 
   const notifyV2 = (sessionId: SessionId, update: v2.SessionUpdate): Promise<void> =>
     enqueueV2(sessionId, () => sendV2(sessionId, update))
+
+  const childControl = config.protocolV2 === true ? new V2ChildControl(ctx, (id) => {
+    const record = sessions.get(id)
+    return !closed && v2Client !== undefined && record?.isOpen === true ? record.agent : undefined
+  }, (parent, send) => { void enqueueV2(parent, send).catch(() => {}) }, sendV2) : undefined
 
   const readHistory = async (sessionId: SessionId, cwd: string, signal: AbortSignal) => {
     const header = (await persistence.stat(sessionId, { signal }))?.header
@@ -724,9 +730,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
     .onRequest(v2.methods.agent.session.prompt, ({ params, signal }) => v2Result(() => {
       const prompt = parseKeyedPrompt({ ...params, idempotencyKey: params.idempotencyKey ?? randomUUID() })
       const id = brandString<SessionId>(params.sessionId)
-      return requireSession(id).promptWithId(prompt, prompt.idempotencyKey, false, persistence, signal, retainPromptContent(params.prompt), (reason) => {
-        void notifyV2(id, v2Settlement(reason)).catch(() => {})
-      })
+      return requireSession(id).promptWithId(
+        prompt, prompt.idempotencyKey, false, persistence, signal, retainPromptContent(params.prompt), (reason) => {
+          void notifyV2(id, v2Settlement(reason)).catch(() => {})
+        },
+      )
     }))
     .onRequest('_session/steering', value => value, ({ params, signal }) => v2Result(async () => {
       const steering = parseSteering(params)
@@ -736,7 +744,12 @@ export function apply(ctx: Context, config: AcpConfig): void {
         ? { outcome: 'promptRequired', reason: 'noRunningTurn' }
         : { outcome: 'injected', ...receipt }
     }))
-    .onNotification(v2.methods.agent.session.cancel, ({ params }) => implementation.cancel(params))
+    .onNotification(v2.methods.agent.session.cancel, ({ params }) => {
+      const id = brandString<SessionId>(params.sessionId)
+      const root = sessions.get(id)
+      if (root !== undefined) root.cancel()
+      else childControl?.cancel(id)
+    })
     .onRequest(v2.methods.agent.toolCall.cancel, ({ params }) => v2Result(async () => {
       const id = brandString<SessionId>(params.sessionId)
       const approval = v2Approvals.get(id)?.get(params.toolCallId)
@@ -746,6 +759,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
     }))
     .onRequest(v2.methods.agent.session.close, ({ params }) => v2Result(async () => {
       const id = brandString<SessionId>(params.sessionId)
+      childControl?.detach(id)
       const response = await implementation.closeSession(params)
       await v2Updates.get(id)
       v2Updates.delete(id)
@@ -785,6 +799,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
     if (quiescing !== undefined) return quiescing
     closed = true
     const records = [...sessions.values()]
+    for (const record of records) childControl?.detach(record.agent.id)
     // AcpSession.close cancels synchronously before its first await, so every owned
     // prompt stops before any descendant or persistence drain can block.
     quiescing = (async () => {

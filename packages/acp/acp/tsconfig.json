@@ -45,6 +45,9 @@
       "path": "../../session/session-persistence"
     },
     {
+      "path": "../../subagent/subagent"
+    },
+    {
       "path": "../../interaction/user-approval"
     }
   ]

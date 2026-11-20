@@ -62,6 +62,8 @@ With `cursorSigningKeyFile`, the v2 bridge announces a signed cursor after each 
 
 An explicit v2 replay restores read-only first-level associations for selected, settled local children that the parent catalog and child header both identify. The bridge announces each child, replays its own retained user and assistant messages, and sends that child its own `replay_complete`. Inherited fork history and runtime-generated delegation context stay out of the child transcript. A missing or mismatched selected child returns `dsh_child_history_unavailable` before replay begins.
 
+While a directly owned in-process child runs a native turn, its parent association grants `capabilities.cancel`. Send `session/cancel` with that child's ID to interrupt that turn. The bridge reports cancelled idle only after the same turn records an ancestor interruption and the child becomes idle. The capability is withdrawn at idle; detached roots and retained replay grant no live control.
+
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-acp) is the exhaustive source for every accepted field and its JSDoc.
 
 ### Start a server
