@@ -22,6 +22,7 @@ import { AcpContentError, admitAcpPrompt } from './content.ts'
 import { turnEndToStopReason } from './codec.ts'
 import { mountAcpMcpServers } from './mcp.ts'
 import { AcpModelControl } from './model-control.ts'
+import { matchPromptContent } from './prompt-content.ts'
 import { assistantUpdates, toolCallUpdate, toolResultUpdate } from './updates.ts'
 
 /** Subagent completion and teardown without depending on the subagent package. */
@@ -73,6 +74,7 @@ interface InflightPrompt {
   agentError: Error | undefined
   keyed: {
     id: MessageId
+    clientContent: UserMessage['clientContent']
     committed: boolean
     durable: PromiseWithResolvers<void>
   } | undefined
@@ -294,6 +296,7 @@ export class AcpSession {
         const native = createUserMessage({
           content,
           source: { kind: 'user' },
+          ...(keyed?.clientContent !== undefined ? { clientContent: keyed.clientContent } : {}),
         })
         const message = keyed === undefined ? native : Object.freeze({ ...native, id: keyed.id })
         inflight.messageId = message.id
@@ -339,6 +342,7 @@ export class AcpSession {
    * @param imageEnabled - connection capability used during prompt admission.
    * @param persistence - durable session history used to resolve retained retries.
    * @param signal - JSON-RPC request cancellation signal.
+   * @param clientContent - original ACP blocks attached to resource-bearing native prompts.
    * @param onSettled - optional callback for foreground completion of a newly inserted prompt.
    * @returns the stable receipt for a retained or newly persisted user message.
    */
@@ -348,6 +352,7 @@ export class AcpSession {
     imageEnabled: boolean,
     persistence: SessionPersistence,
     signal: AbortSignal,
+    clientContent: UserMessage['clientContent'],
     onSettled?: (reason: StopReason | 'error') => void,
   ): Promise<{ messageId: string }> {
     this.assertActive()
@@ -355,12 +360,15 @@ export class AcpSession {
     const pending = this.keyedInputs.get(id)
     if (pending !== undefined) {
       const receipt = await pending
-      if (receipt !== undefined) return receipt
-      return this.promptWithId(params, key, imageEnabled, persistence, signal, onSettled)
+      if (receipt !== undefined) {
+        if (!await this.hasRetainedInput(id, persistence, signal, clientContent)) throw internalError('the native prompt was not retained')
+        return receipt
+      }
+      return this.promptWithId(params, key, imageEnabled, persistence, signal, clientContent, onSettled)
     }
     return this.submitKeyed(id, async () => {
-      if (await this.hasRetainedInput(id, persistence, signal)) return { messageId: id }
-      const keyed = { id, committed: false, durable: Promise.withResolvers<void>() }
+      if (await this.hasRetainedInput(id, persistence, signal, clientContent)) return { messageId: id }
+      const keyed = { id, clientContent, committed: false, durable: Promise.withResolvers<void>() }
       void this.prompt(params, imageEnabled, signal, keyed).then(({ stopReason }) => {
         if (keyed.committed) onSettled?.(stopReason)
         if (keyed.committed) return
@@ -393,7 +401,13 @@ export class AcpSession {
     this.assertActive()
     const id = this.keyedMessageId(key)
     const pending = this.keyedInputs.get(id)
-    if (pending !== undefined) return pending
+    if (pending !== undefined) {
+      const receipt = await pending
+      if (receipt !== undefined && !await this.hasRetainedInput(id, persistence, signal)) {
+        throw internalError('the native prompt was not retained')
+      }
+      return receipt
+    }
     const inject = this.agent.runningTurnInjector?.()
     return this.submitKeyed(id, async () => {
       if (await this.hasRetainedInput(id, persistence, signal)) return { messageId: id }
@@ -412,14 +426,30 @@ export class AcpSession {
       .update(JSON.stringify([this.agent.session.id, key])).digest('hex'))
   }
 
-  private async hasRetainedInput(id: MessageId, persistence: SessionPersistence, signal: AbortSignal): Promise<boolean> {
+  private async hasRetainedInput(
+    id: MessageId, persistence: SessionPersistence, signal: AbortSignal, clientContent?: UserMessage['clientContent'],
+  ): Promise<boolean> {
     signal.throwIfAborted()
     const session = this.agent.session
     if (!await this.ctx.sessions.flush(session)) throw internalError('no session durability listener is available')
     const reader = await persistence.open(session.id, 'read')
     try {
       const { events } = await reader.read()
-      return events.some(event => event.type === 'user/message' && event.data.id === id)
+      const event = events.find(event => event.type === 'user/message' && event.data.id === id)
+      if (event?.type === 'user/message') {
+        matchPromptContent(event.data.clientContent, clientContent)
+        return true
+      }
+      for (const event of events) {
+        if (event.type !== 'agent/inbox/spliced') continue
+        const admitted = event.data.inserted.find(message => message.id === id)
+        if (admitted === undefined || (admitted.clientContent === undefined && clientContent === undefined)) continue
+        matchPromptContent(admitted.clientContent, clientContent)
+        throw new RequestError(-32000, 'The native DeepSeek Harness inbox admitted this typed prompt before insertion.', {
+          kind: 'dsh_prompt_dispatch_unknown',
+        })
+      }
+      return false
     } finally {
       await reader.close()
     }
@@ -450,6 +480,7 @@ export class AcpSession {
       keyed.committed = true
       void Promise.resolve().then(async () => {
         if (!await this.ctx.sessions.flush(session)) throw internalError('no session durability listener is available')
+        matchPromptContent(event.data.clientContent, keyed.clientContent)
       }).then(keyed.durable.resolve, keyed.durable.reject)
     }
     if (event.type === 'turn/start' && this.inflight?.turn !== undefined) {

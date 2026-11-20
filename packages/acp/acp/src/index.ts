@@ -54,6 +54,7 @@ import type {} from '@deepseek-ai/dsh-user-approval'
 import { supportsAcpImagePrompts } from './content.ts'
 import { AcpMcpConfigError } from './mcp.ts'
 import { AcpModelConfigError } from './model-control.ts'
+import { retainPromptContent, storedPromptContent } from './prompt-content.ts'
 import { AcpSession, type CreateAcpSessionOptions } from './session.ts'
 import { cursorAfter, cursorKey, FABRIC_CURSOR_REPLAY } from './cursors.ts'
 import { V2ToolUpdates } from './updates.ts'
@@ -141,7 +142,8 @@ function v2Message(event: SessionEvent): Extract<v2.SessionUpdate, { sessionUpda
   if (event.type !== 'user/message' && event.type !== 'assistant/message') return undefined
   if (event.type === 'user/message' && event.data.source.kind !== 'user') return undefined
   const message = event.type === 'user/message' ? event.data : event.data.message
-  const content = message.content.flatMap(block => block.type === 'text'
+  const original = event.type === 'user/message' ? storedPromptContent(event.data.clientContent) : undefined
+  const content = original ?? message.content.flatMap(block => block.type === 'text'
     ? [{ type: 'text' as const, text: block.text }]
     : [])
   return event.type === 'user/message'
@@ -663,7 +665,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
     .onRequest(v2.methods.agent.session.prompt, ({ params, signal }) => v2Result(() => {
       const prompt = parseKeyedPrompt({ ...params, idempotencyKey: params.idempotencyKey ?? randomUUID() })
       const id = brandString<SessionId>(params.sessionId)
-      return requireSession(id).promptWithId(prompt, prompt.idempotencyKey, false, persistence, signal, (reason) => {
+      return requireSession(id).promptWithId(prompt, prompt.idempotencyKey, false, persistence, signal, retainPromptContent(params.prompt), (reason) => {
         void notifyV2(id, v2Settlement(reason)).catch(() => {})
       })
     }))

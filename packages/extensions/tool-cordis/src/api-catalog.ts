@@ -11572,7 +11572,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'UserMessage',
-    declaration: 'export interface UserMessage extends MessageBase {\n    readonly role: \'user\';\n}',
+    declaration: 'export interface UserMessage extends MessageBase {\n    readonly role: \'user\';\n    readonly clientContent?: {\n        readonly format: string;\n        readonly json: string;\n    };\n}',
   },
   {
     name: 'VerifiedWebhookDelivery',

@@ -14,6 +14,11 @@ The append-only event types. Merge-extensible: a plugin declares extra event typ
 /** A user-role specialization of the shared message representation. */
 interface UserMessage extends MessageBase {
   readonly role: 'user'
+  /** Original client content when the transport's typed blocks require a separate model projection. */
+  readonly clientContent?: {
+    readonly format: string
+    readonly json: string
+  }
 }
 ```
 
