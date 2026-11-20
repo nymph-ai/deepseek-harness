@@ -261,6 +261,14 @@ declare module './types.ts' {
     steer(message: UserMessage): void
 
     /**
+     * Capture the accepting turn. The returned operation resolves true only
+     * when that exact turn appends the native user message to its session log.
+     * The input expires at turn end and never wakes the agent.
+     * @returns an injector for the open turn, or undefined if no turn can accept input.
+     */
+    runningTurnInjector?(): ((message: UserMessage) => Promise<boolean>) | undefined
+
+    /**
    * Queue model-facing context for the next pre-step without waking the
    * driver. A running driver claims it at the nearest later step boundary;
    * idle drivers leave it pending until follow-up or steering

@@ -97,6 +97,19 @@ function parseKeyedPrompt(value: unknown): PromptRequest & { idempotencyKey: str
   }
 }
 
+function parseSteering(value: unknown): ReturnType<typeof parseKeyedPrompt> {
+  if (typeof value !== 'object' || value === null) throw invalidParams('expected steering parameters')
+  const meta = '_meta' in value ? value._meta : undefined
+  const steering = typeof meta === 'object' && meta !== null && 'steering' in meta ? meta.steering : undefined
+  if (steering === undefined) return parseKeyedPrompt({ ...value, idempotencyKey: randomUUID() })
+  if (typeof steering !== 'object' || steering === null
+    || ('idleBehavior' in steering && steering.idleBehavior !== 'promptRequired')) {
+    throw invalidParams('unsupported steering idle behavior')
+  }
+  const key = 'idempotencyKey' in steering ? steering.idempotencyKey : randomUUID()
+  return parseKeyedPrompt({ ...value, idempotencyKey: key })
+}
+
 async function v2Result<T>(run: () => Promise<T>): Promise<T> {
   try {
     return await run()
@@ -524,7 +537,10 @@ export function apply(ctx: Context, config: AcpConfig): void {
       protocolVersion: 2,
       info: { name: 'deepseek-harness-acp', version: '0.0.1' },
       capabilities: { session: {} },
-      _meta: { 'nymph.ai/fabric': { keyedTextPrompts: true } },
+      _meta: {
+        'nymph.ai/fabric': { keyedTextPrompts: true, keyedTextSteering: true },
+        steering: { supported: true },
+      },
     }))
     .onRequest(v2.methods.agent.session.new, ({ params, signal }) => v2Result(async () => {
       if (params.additionalDirectories?.length || params.mcpServers?.length
@@ -571,6 +587,14 @@ export function apply(ctx: Context, config: AcpConfig): void {
       return requireSession(id).promptWithId(prompt, prompt.idempotencyKey, false, persistence, signal, (reason) => {
         void notifyV2(id, v2Settlement(reason)).catch(() => {})
       })
+    }))
+    .onRequest('_session/steering', value => value, ({ params, signal }) => v2Result(async () => {
+      const steering = parseSteering(params)
+      const id = brandString<SessionId>(steering.sessionId)
+      const receipt = await requireSession(id).steerWithId(steering, steering.idempotencyKey, persistence, signal)
+      return receipt === undefined
+        ? { outcome: 'promptRequired', reason: 'noRunningTurn' }
+        : { outcome: 'injected', ...receipt }
     }))
     .onNotification(v2.methods.agent.session.cancel, ({ params }) => implementation.cancel(params))
     .onRequest(v2.methods.agent.session.close, ({ params }) => v2Result(async () => {

@@ -83,6 +83,37 @@ it('cancellation still aborts the running request when queue clearing fails', as
   }
 })
 
+it('expires active-only input when its owning turn aborts and never queues it for a replacement', async () => {
+  const { ctx, agent, adapter } = await harness()
+  const entered = Promise.withResolvers<undefined>()
+  const release = Promise.withResolvers<undefined>()
+  const stop = ctx.on('agent/turn-stopping', async () => {
+    entered.resolve(undefined)
+    await release.promise
+  })
+  try {
+    expect(agent.runningTurnInjector?.()).toBeUndefined()
+    agent.followup(input('foreground'))
+    await entered.promise
+    const inject = agent.runningTurnInjector?.()
+    expect(inject).toBeDefined()
+    const insertion = inject!(input('expired steering'))
+    agent.cancel({ kind: 'user' })
+    agent.followup(input('replacement turn'))
+    release.resolve(undefined)
+    await expect(insertion).resolves.toBe(false)
+    await agent.whenIdle()
+    await expect(inject!(input('stale capture'))).resolves.toBe(false)
+    expect(agent.inbox.nextStep).toHaveLength(0)
+    expect(adapter.requests).toHaveLength(2)
+    expect(adapter.requests[1]?.messages.at(-1)?.content).toEqual([{ type: 'text', text: 'replacement turn' }])
+    expect(JSON.stringify(adapter.requests)).not.toContain('expired steering')
+  } finally {
+    release.resolve(undefined)
+    stop()
+  }
+})
+
 it('waits for admitted maintenance after a queue-clear failure before releasing its Session', async () => {
   const { ctx, agent, handle } = await harness()
   const release = Promise.withResolvers<undefined>()

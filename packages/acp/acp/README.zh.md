@@ -51,6 +51,8 @@ kind: "package-reference"
 
 v2 预览版接受文本和资源链接，将链接渲染为原生文本，不访问 URI。它在原生会话持久化后确认带幂等键的提示词，重启后重试会返回同一消息 ID。初始化响应声明 `_meta["nymph.ai/fabric"].keyedTextPrompts`。为 `session/resume` 传入 `replayFrom: { "type": "start" }` 会回放文本对话。游标回放、工具历史、图像提示词、客户端 MCP 配置及会话分叉不属于本次 v2 预览范围。
 
+v2 预览版同时声明 `_meta.steering.supported` 和 `_meta["nymph.ai/fabric"].keyedTextSteering`。通过 `_session/steering` 发送文本或资源链接时，可在 `_meta.steering` 中提供 `idempotencyKey` 和 `idleBehavior: "promptRequired"`。输入只会加入当前轮次，并在原生消息持久化后返回回执。空闲时返回 `promptRequired`，不会启动新轮次。重启后可重用已持久化的回执。
+
 生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-acp)是每个受支持字段及其 JSDoc 的穷尽式真源。
 
 ### 启动服务器

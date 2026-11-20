@@ -34,6 +34,10 @@ function oneToolCall(): StreamChunk[] {
   ]
 }
 
+function makeV2Harness(persistenceRoot: string, script: StreamChunk[][] = []): Promise<BridgeHarness> {
+  return makeBridgeHarness({ script, persistenceRoot, config: { protocolV2: true }, connectV2: true })
+}
+
 describe('automation-only ACP bridge', () => {
   let harness: BridgeHarness | undefined
 
@@ -74,19 +78,17 @@ describe('automation-only ACP bridge', () => {
 
   it('negotiates the opt-in ACP v2 preview and retains native prompt receipts across restart', async () => {
     const persistenceRoot = await mkdtemp(join(tmpdir(), 'dsh-acp-v2-'))
-    const makeHarness = (script: StreamChunk[][] = []) => makeBridgeHarness({
-      script, persistenceRoot, config: { protocolV2: true }, connectV2: true,
-    })
     const m = v2.methods.agent
     const cwd = process.cwd()
     const initialize = (client: v2.ClientContext) => client.request(m.initialize, {
       protocolVersion: 2, info: { name: 'test', version: '0' },
     })
     try {
-      harness = await makeHarness([textResponse('committed answer')])
+      harness = await makeV2Harness(persistenceRoot, [textResponse('committed answer')])
       const client = harness.v2Client!
       await expect(initialize(client)).resolves.toMatchObject({
-        protocolVersion: 2, capabilities: { session: {} }, _meta: { 'nymph.ai/fabric': { keyedTextPrompts: true } },
+        protocolVersion: 2, capabilities: { session: {} },
+        _meta: { 'nymph.ai/fabric': { keyedTextPrompts: true, keyedTextSteering: true }, steering: { supported: true } },
       })
       const { sessionId } = await client.request(m.session.new, { cwd })
       const params = { sessionId, idempotencyKey: 'keyed', prompt: [
@@ -114,7 +116,7 @@ describe('automation-only ACP bridge', () => {
       ])
       await harness.dispose()
 
-      harness = await makeHarness()
+      harness = await makeV2Harness(persistenceRoot)
       const reopened = harness.v2Client!
       await initialize(reopened)
       await reopened.request(m.session.resume, { sessionId, cwd, replayFrom: { type: 'start' } })
@@ -124,6 +126,90 @@ describe('automation-only ACP bridge', () => {
       await expect(reopened.request(m.session.prompt, params)).resolves.toEqual(receipt)
       expect(harness.adapter.requests).toHaveLength(0)
     } finally {
+      await harness?.dispose()
+      harness = undefined
+      await rm(persistenceRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('inserts keyed steering into the captured native turn and reuses it cold without waking', async () => {
+    const persistenceRoot = await mkdtemp(join(tmpdir(), 'dsh-acp-v2-steering-'))
+    const m = v2.methods.agent
+    const cwd = process.cwd()
+    const initialize = (client: v2.ClientContext) => client.request(m.initialize, {
+      protocolVersion: 2, info: { name: 'tests', version: '0' },
+    })
+    const atBoundary = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    const accepted = Promise.withResolvers<undefined>()
+    try {
+      harness = await makeV2Harness(persistenceRoot, [textResponse('first step'), textResponse('second step')])
+      const client = harness.v2Client!
+      await initialize(client)
+      const { sessionId } = await client.request(m.session.new, { cwd })
+      const agent = harness.ctx.agents.get(brandString<SessionId>(sessionId))!
+      const params = {
+        sessionId,
+        prompt: [{ type: 'text' as const, text: 'active input' }],
+        _meta: { steering: { idleBehavior: 'promptRequired', idempotencyKey: 'active-key' } },
+      }
+      const steer = () => client.request<{ outcome: string; messageId?: string }, typeof params>('_session/steering', params)
+      const refused = { outcome: 'promptRequired', reason: 'noRunningTurn' }
+      await expect(client.request('_session/steering', {
+        ...params, _meta: { steering: { idempotencyKey: '' } },
+      })).rejects.toMatchObject({ code: -32602 })
+      await expect(steer()).resolves.toEqual(refused)
+      expect(harness.adapter.requests).toHaveLength(0)
+      const stop = agent.ctx.on('agent/turn-stopping', async () => {
+        atBoundary.resolve(undefined)
+        await release.promise
+      })
+      const capture = agent.runningTurnInjector!.bind(agent)
+      vi.spyOn(agent, 'runningTurnInjector').mockImplementation(() => {
+        const inject = capture()
+        return inject === undefined ? undefined : (message) => {
+          const result = inject(message)
+          accepted.resolve(undefined)
+          return result
+        }
+      })
+      await client.request(m.session.prompt, { sessionId, prompt: [{ type: 'text', text: 'foreground' }] })
+      await atBoundary.promise
+      const insertion = steer()
+      const liveRetry = steer()
+      await accepted.promise
+      expect(harness.adapter.requests).toHaveLength(1)
+      release.resolve(undefined)
+      const receipt = await insertion
+      expect(receipt.outcome).toBe('injected')
+      expect(typeof receipt.messageId).toBe('string')
+      await expect(liveRetry).resolves.toEqual(receipt)
+      await agent.whenIdle()
+      stop()
+      await expect(steer()).resolves.toEqual(receipt)
+      expect(harness.adapter.requests).toHaveLength(2)
+      expect(harness.adapter.requests[1]?.messages.at(-1)?.content).toEqual([{ type: 'text', text: 'active input' }])
+      const reader = await harness.ctx.sessionPersistence.open(agent.session.id, 'read')
+      try {
+        const { events } = await reader.read()
+        expect(events.filter(event => event.type === 'turn/start')).toHaveLength(1)
+        expect(events.filter(event => event.type === 'user/message' && event.data.id === receipt.messageId)).toHaveLength(1)
+      } finally {
+        await reader.close()
+      }
+      await harness.dispose()
+
+      harness = await makeV2Harness(persistenceRoot)
+      const reopened = harness.v2Client!
+      await initialize(reopened)
+      await reopened.request(m.session.resume, { sessionId, cwd, replayFrom: { type: 'start' } })
+      await expect(reopened.request('_session/steering', params)).resolves.toEqual(receipt)
+      await expect(reopened.request('_session/steering', {
+        ...params, _meta: { steering: { idempotencyKey: 'different-idle-key' } },
+      })).resolves.toEqual(refused)
+      expect(harness.adapter.requests).toHaveLength(0)
+    } finally {
+      release.resolve(undefined)
       await harness?.dispose()
       harness = undefined
       await rm(persistenceRoot, { recursive: true, force: true })

@@ -51,6 +51,8 @@ Every session the server creates uses the provider and model configured here. Bo
 
 The v2 preview accepts text and resource links, which are rendered as native text without dereferencing the URI. It acknowledges keyed prompts after native session persistence and returns the same message ID on retry after restart. Its initialize response advertises `_meta["nymph.ai/fabric"].keyedTextPrompts`. `session/resume` with `replayFrom: { "type": "start" }` replays the text conversation. Cursor replay, tool history, image prompts, client MCP setup, and forks are outside the v2 preview.
 
+The v2 preview also advertises `_meta.steering.supported` and `_meta["nymph.ai/fabric"].keyedTextSteering`. Send text or resource links via `_session/steering` with `_meta.steering.idempotencyKey` and `idleBehavior: "promptRequired"`. The existing turn owns the input and the bridge replies after its native user message is durable. An idle session returns `promptRequired` without starting work, and a retained receipt is reusable after restart.
+
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-acp) is the exhaustive source for every accepted field and its JSDoc.
 
 ### Start a server
