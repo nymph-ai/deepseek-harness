@@ -113,6 +113,8 @@ export class AcpSession {
   private inflight: InflightPrompt | undefined
   private closing: Promise<void> | undefined
   private readonly keyedInputs = new Map<MessageId, Promise<{ messageId: string } | undefined>>()
+  private readonly heldPrompts = new Map<AbortController, Promise<{ messageId: string }>>()
+  private foregroundTail = Promise.resolve()
 
   private constructor(
     private readonly ctx: Context,
@@ -371,22 +373,53 @@ export class AcpSession {
       }
       return this.promptWithId(params, key, imageEnabled, persistence, signal, clientContent, onSettled)
     }
-    return this.submitKeyed(id, async () => {
-      if (await this.hasRetainedInput(id, persistence, signal, clientContent)) return { messageId: id }
-      const keyed = { id, clientContent, committed: false, durable: Promise.withResolvers<void>() }
-      void this.prompt(params, imageEnabled, signal, keyed).then(({ stopReason }) => {
-        if (keyed.committed) onSettled?.(stopReason)
-        if (keyed.committed) return
-        keyed.durable.reject(stopReason === 'cancelled'
-          ? RequestError.requestCancelled()
-          : internalError('the prompt settled before a native user message was committed'))
-      }, (error: unknown) => {
-        if (keyed.committed) onSettled?.('error')
-        if (!keyed.committed) keyed.durable.reject(error)
-      })
-      await keyed.durable.promise
-      return { messageId: id }
-    })
+    const previous = this.foregroundTail
+    const released = Promise.withResolvers<void>()
+    this.foregroundTail = previous.then(() => released.promise)
+    const hold = new AbortController()
+    const heldSignal = AbortSignal.any([signal, hold.signal])
+    const queued = this.submitKeyed(id, async () => {
+      const cancelled = Promise.withResolvers<never>()
+      const onAbort = (): void => { cancelled.reject(RequestError.requestCancelled()) }
+      const assertNotCancelled = (): void => {
+        if (heldSignal.aborted) throw RequestError.requestCancelled()
+      }
+      heldSignal.addEventListener('abort', onAbort, { once: true })
+      let started = false
+      try {
+        assertNotCancelled()
+        // Retained receipts can resolve while foreground work is active. New
+        // input waits in its arrival slot until the prior prompt settles.
+        if (await Promise.race([this.hasRetainedInput(id, persistence, heldSignal, clientContent), cancelled.promise])) {
+          return { messageId: id }
+        }
+        await Promise.race([previous, cancelled.promise])
+        do {
+          await Promise.race([this.agent.whenIdle(), cancelled.promise])
+        } while (this.agent.status !== 'idle')
+        assertNotCancelled()
+        this.heldPrompts.delete(hold)
+        started = true
+        const keyed = { id, clientContent, committed: false, durable: Promise.withResolvers<void>() }
+        void this.prompt(params, imageEnabled, signal, keyed).then(({ stopReason }) => {
+          if (keyed.committed) onSettled?.(stopReason)
+          if (keyed.committed) return
+          keyed.durable.reject(stopReason === 'cancelled'
+            ? RequestError.requestCancelled()
+            : internalError('the prompt settled before a native user message was committed'))
+        }, (error: unknown) => {
+          if (keyed.committed) onSettled?.('error')
+          if (!keyed.committed) keyed.durable.reject(error)
+        }).finally(released.resolve)
+        await keyed.durable.promise
+        return { messageId: id }
+      } finally {
+        heldSignal.removeEventListener('abort', onAbort)
+        if (!started) released.resolve()
+      }
+    }).finally(() => { this.heldPrompts.delete(hold) })
+    this.heldPrompts.set(hold, queued)
+    return queued
   }
 
   /**
@@ -437,9 +470,10 @@ export class AcpSession {
     signal.throwIfAborted()
     const session = this.agent.session
     if (!await this.ctx.sessions.flush(session)) throw internalError('no session durability listener is available')
-    const reader = await persistence.open(session.id, 'read')
+    signal.throwIfAborted()
+    const reader = await persistence.open(session.id, 'read', { signal })
     try {
-      const { events } = await reader.read()
+      const { events } = await reader.read(0, undefined, { signal })
       const event = events.find(event => event.type === 'user/message' && event.data.id === id)
       if (event?.type === 'user/message') {
         matchPromptContent(event.data.clientContent, clientContent)
@@ -468,6 +502,7 @@ export class AcpSession {
 
   /** Cancel the active prompt, or autonomous work when no ACP prompt exists. */
   cancel(): void {
+    void this.dropHeldPrompts()
     const inflight = this.inflight
     this.cancelPrompt('ACP prompt cancelled')
     if (inflight === undefined) this.agent.cancel({ kind: 'user' })
@@ -586,9 +621,11 @@ export class AcpSession {
     this.closing = (async () => {
       const failures: unknown[] = []
       const inflight = this.inflight
+      const held = this.dropHeldPrompts()
       this.cancelPrompt(detail)
       if (inflight === undefined || !inflight.messageQueued) this.agent.cancel({ kind: 'user' })
       try {
+        await held
         await inflight?.admissionDone
         await this.agent.whenIdle()
         await this.outputTail
@@ -620,6 +657,12 @@ export class AcpSession {
       /* v8 ignore stop */
     })()
     return this.closing
+  }
+
+  private async dropHeldPrompts(): Promise<void> {
+    const held = [...this.heldPrompts]
+    for (const [controller] of held) controller.abort()
+    await Promise.allSettled(held.map(([, pending]) => pending))
   }
 
   private assertActive(): void {
