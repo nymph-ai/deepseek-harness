@@ -442,8 +442,9 @@ export class AcpSession {
    * Process one durable event and enqueue its standard ACP projections.
    * @param session - exact event-owning Session.
    * @param event - committed durable event.
+   * @param legacyTools - include tool updates from the v1 projection.
    */
-  onSessionEvent(session: Session, event: SessionEvent): void {
+  onSessionEvent(session: Session, event: SessionEvent, legacyTools = true): void {
     const keyed = this.inflight?.keyed
     if (keyed !== undefined && !keyed.committed && event.type === 'user/message' && event.data.id === keyed.id) {
       keyed.committed = true
@@ -469,7 +470,7 @@ export class AcpSession {
           if (inflight !== undefined) inflight.outputError ??= failure
           this.ctx.logger.warn(`acp: assistant output conversion failed: ${errorChain(error)}`)
         })
-      } else if (event.type === 'tool/call') {
+      } else if (legacyTools && event.type === 'tool/call') {
         const previous = this.outputTail
         this.outputTail = previous
           .then(() => this.notify({ sessionId: this.agent.session.id, update: toolCallUpdate(event) }))
@@ -478,7 +479,7 @@ export class AcpSession {
             this.ctx.logger.warn(`acp: tool-call update delivery failed: ${errorChain(error)}`)
           })
         /* v8 ignore stop */
-      } else if (event.type === 'tool/result') {
+      } else if (legacyTools && event.type === 'tool/result') {
         const previous = this.outputTail
         this.outputTail = previous
           .then(async () => this.notify({

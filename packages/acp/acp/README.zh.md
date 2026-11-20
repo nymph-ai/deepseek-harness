@@ -50,7 +50,9 @@ kind: "package-reference"
 | `protocolV2` | `false` | 在 ACP v1 之外启用面向文本的 ACP v2 预览版协商 |
 | `cursorSigningKeyFile` | — | 启用原生 ACP v2 游标的持久存储绝对路径 |
 
-v2 预览版接受文本和资源链接，将链接渲染为原生文本，不访问 URI。它在原生会话持久化后确认带幂等键的提示词，重启后重试会返回同一消息 ID。初始化响应声明 `_meta["nymph.ai/fabric"].keyedTextPrompts`。为 `session/resume` 传入 `replayFrom: { "type": "start" }` 会回放文本对话。工具历史、图像提示词和客户端 MCP 配置不属于本次 v2 预览范围。
+v2 预览版接受文本和资源链接，将链接渲染为原生文本，不访问 URI。它在原生会话持久化后确认带幂等键的提示词，重启后重试会返回同一消息 ID。初始化响应声明 `_meta["nymph.ai/fabric"].keyedTextPrompts`。为 `session/resume` 传入 `replayFrom: { "type": "start" }` 会回放文本对话和工具更新。图像提示词和客户端 MCP 配置不属于本次 v2 预览范围。
+
+已记录的工具调用显示为等待中。关联的结果提供成功、失败或取消状态，以及已记录的输出。ACP 工具 ID 对应原生调用序号，提供方的工具 ID 记录在 `_meta["nymph.ai/fabric"].nativeToolCallId` 中。实时更新和历史回放使用相同的 ID。缺少关联结果的工具记录保留等待状态。结果附件缺失时，仍会提供状态和可用输出，并在元数据中设置 `toolOutputPartial`。
 
 v2 预览版同时声明 `_meta.steering.supported` 和 `_meta["nymph.ai/fabric"].keyedTextSteering`。通过 `_session/steering` 发送文本或资源链接时，可在 `_meta.steering` 中提供 `idempotencyKey` 和 `idleBehavior: "promptRequired"`。输入只会加入当前轮次，并在原生消息持久化后返回回执。空闲时返回 `promptRequired`，不会启动新轮次。重启后可重用已持久化的回执。
 

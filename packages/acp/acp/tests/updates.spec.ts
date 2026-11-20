@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { Context } from '@deepseek-ai/cordis'
+import { Context } from '@deepseek-ai/cordis'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import type { ToolCallId, MessageId } from '@deepseek-ai/dsh-llm'
+import { createToolResultMessage, type ToolCallId, type MessageId } from '@deepseek-ai/dsh-llm'
 import { SessionSeq, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
-import { assistantUpdates, toolCallUpdate, toolResultUpdate } from '../src/updates.ts'
+import { assistantUpdates, toolCallUpdate, toolResultUpdate, V2ToolUpdates } from '../src/updates.ts'
 
 /** Minimal committed assistant event for pure update projection tests. */
 function assistantEvent(
@@ -90,5 +90,40 @@ describe('standard ACP update projection', () => {
       status: 'failed',
       content: [],
     })
+  })
+
+  it('issues a cancellation for the exact linked native occurrence', async () => {
+    const ctx = new Context()
+    const tools = new V2ToolUpdates()
+    const callId = brandString<ToolCallId>('same-provider-id')
+    const call: SessionEvent<'tool/call'> = {
+      type: 'tool/call', seq: SessionSeq(1), time: 0,
+      data: { callId, name: 'read', arguments: '{}', turn: 1, step: 1 },
+    }
+    await expect(tools.observe(ctx, call)?.()).resolves.toMatchObject({
+      toolCallId: 'dsh-tool:1', status: 'pending',
+    })
+    expect(tools.forApproval(callId)).toBe('dsh-tool:1')
+    await expect(tools.observe(ctx, { ...call, seq: SessionSeq(2) })?.()).resolves.toMatchObject({
+      toolCallId: 'dsh-tool:2', status: 'pending',
+    })
+    expect(tools.forApproval(callId)).toBeUndefined()
+
+    const result: SessionEvent<'tool/result'> = {
+      type: 'tool/result', seq: SessionSeq(3), time: 0, surfaceOp: 'append', sourceEventSeqs: [call.seq],
+      data: {
+        turn: 1, step: 1,
+        message: createToolResultMessage({ callId, isError: true, content: [{ type: 'text', text: 'Cancelled' }] }),
+        error: { name: 'AbortError', code: 'ABORTED_BEFORE_DISPATCH' },
+      },
+    }
+    expect(tools.observe(ctx, { ...result, sourceEventSeqs: [SessionSeq(0)] })).toBeUndefined()
+    await expect(tools.observe(ctx, result)?.()).resolves.toEqual({
+      sessionUpdate: 'tool_call_update', toolCallId: 'dsh-tool:1', status: 'cancelled',
+      content: [{ type: 'content', content: { type: 'text', text: 'Cancelled' } }],
+      rawOutput: { error: { name: 'AbortError', code: 'ABORTED_BEFORE_DISPATCH' } },
+    })
+    expect(tools.forApproval(callId)).toBe('dsh-tool:2')
+    expect(tools.observe(ctx, result)).toBeUndefined()
   })
 })
