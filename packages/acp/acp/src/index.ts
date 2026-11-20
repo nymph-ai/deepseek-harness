@@ -56,6 +56,7 @@ import { AcpMcpConfigError } from './mcp.ts'
 import { AcpModelConfigError } from './model-control.ts'
 import { AcpSession, type CreateAcpSessionOptions } from './session.ts'
 import { cursorAfter, cursorKey, FABRIC_CURSOR_REPLAY } from './cursors.ts'
+import { V2ToolUpdates } from './updates.ts'
 
 const DEFAULT_SESSION_LIST_PAGE_SIZE = 100
 
@@ -205,6 +206,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
   let imagePromptEnabled = false
   let v2Client: v2.AgentContext | undefined
   const v2Updates = new Map<SessionId, Promise<void>>()
+  const v2Tools = new Map<SessionId, V2ToolUpdates>()
   const signingKey = config.protocolV2 === true && config.cursorSigningKeyFile !== undefined
     ? cursorKey(config.cursorSigningKeyFile)
     : undefined
@@ -276,10 +278,6 @@ export function apply(ctx: Context, config: AcpConfig): void {
         const id = brandString<SessionId>(notification.sessionId)
         if (update.sessionUpdate === 'config_option_update') {
           await notifyV2(id, { sessionUpdate: 'config_option_update', configOptions: v2Config(update.configOptions) })
-        } else if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
-          const { content, ...fields } = update
-          const display = content?.filter(item => item.type === 'content') as v2.ToolCallContent[] | undefined
-          await notifyV2(id, { ...fields, sessionUpdate: 'tool_call_update', ...(display === undefined ? {} : { content: display }) })
         } else if (update.sessionUpdate === 'usage_update') {
           await notifyV2(id, update)
         }
@@ -296,15 +294,22 @@ export function apply(ctx: Context, config: AcpConfig): void {
   ctx.on('session/event', (session, event) => {
     const record = sessions.get(session.header.id)
     if (record?.ownsSession(session) !== true) return
-    record.onSessionEvent(session, event)
+    record.onSessionEvent(session, event, v2Client === undefined)
     if (v2Client !== undefined) {
       if (event.type === 'turn/start') {
+        v2Tools.set(session.id, new V2ToolUpdates())
         void notifyV2(session.header.id, { sessionUpdate: 'state_update', state: 'running' }).catch(() => {})
       }
       const update = v2Message(event)
-      if (update === undefined) return
+      const tool = v2Tools.get(session.id)?.observe(ctx, event)
+      if (event.type === 'turn/end') v2Tools.delete(session.id)
+      if (update === undefined && tool === undefined) return
       void enqueueV2(session.id, async () => {
-        await sendV2(session.id, update)
+        if (tool !== undefined) {
+          await sendV2(session.id, await tool())
+          return
+        }
+        if (update !== undefined) await sendV2(session.id, update)
         const cursor = signingKey === undefined ? undefined : cursorAfter(signingKey, session.id, event)
         if (cursor !== undefined && await ctx.sessions.flush(session)) await sendV2(session.id, cursor)
       }).catch(() => {})
@@ -334,7 +339,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
     const record = ownedRecord(request.agent)
     if (record === undefined || request.callId === undefined) return next()
     const callId = request.callId
-    return record.drainUpdates().then(() => {
+    return record.drainUpdates().then(async () => {
       const params: RequestPermissionRequest = {
         sessionId: record.agent.session.id,
         toolCall: { toolCallId: callId },
@@ -343,16 +348,21 @@ export function apply(ctx: Context, config: AcpConfig): void {
           { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
         ],
       }
+      let response
       if (v2Client !== undefined) {
-        return v2Client.request(v2.methods.client.session.requestPermission, {
+        await v2Updates.get(record.agent.session.id)
+        const toolCallId = v2Tools.get(record.agent.session.id)?.forApproval(callId)
+        if (toolCallId === undefined) return 'rejected'
+        response = await v2Client.request(v2.methods.client.session.requestPermission, {
           sessionId: params.sessionId,
           title: 'DeepSeek Harness requests permission',
-          subject: { type: 'tool_call', toolCall: { toolCallId: callId } },
+          subject: { type: 'tool_call', toolCall: { toolCallId } },
           options: params.options,
         })
+      } else {
+        response = await conn.request(methods.client.session.requestPermission, params)
       }
-      return conn.request(methods.client.session.requestPermission, params)
-    }).then(({ outcome }) => {
+      const { outcome } = response
       if (outcome.outcome === 'cancelled') return 'cancelled'
       return 'optionId' in outcome && outcome.optionId === 'allow-once' ? 'allowed-once' : 'rejected'
     })
@@ -626,9 +636,14 @@ export function apply(ctx: Context, config: AcpConfig): void {
           if (replay != null) {
             const events = await readHistory(sessionId, params.cwd, signal)
             const start = replayCursorId === undefined ? 0 : resolveCursor(sessionId, events, replayCursorId) + 1
+            const tools = new V2ToolUpdates()
             for (const event of events.slice(start)) {
               const update = v2Message(event)
-              if (update === undefined) continue
+              if (update === undefined) {
+                const tool = tools.observe(ctx, event)
+                if (tool !== undefined) await sendV2(sessionId, await tool())
+                continue
+              }
               await sendV2(sessionId, update)
               const cursor = signingKey === undefined ? undefined : cursorAfter(signingKey, sessionId, event)
               if (cursor !== undefined) await sendV2(sessionId, cursor)
@@ -640,6 +655,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
       } catch (error: unknown) {
         await implementation.closeSession({ sessionId })
         v2Updates.delete(sessionId)
+        v2Tools.delete(sessionId)
         throw error
       }
       return { configOptions: v2Config(configOptions) }
@@ -665,6 +681,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
       const response = await implementation.closeSession(params)
       await v2Updates.get(id)
       v2Updates.delete(id)
+      v2Tools.delete(id)
       return response
     }))
     .onRequest(v2.methods.agent.session.setConfigOption, ({ params, signal }) => v2Result(async () => {

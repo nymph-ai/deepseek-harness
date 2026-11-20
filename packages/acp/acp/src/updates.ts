@@ -2,8 +2,10 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionUpdate, ToolCallContent } from '@agentclientprotocol/sdk'
-import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import { errorChain, type ToolCallId } from '@deepseek-ai/dsh-llm'
+import type { Session, SessionEvent, SessionSeq } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-token-meter'
+import type { SessionUpdate as V2SessionUpdate } from 'acp-v2-sdk/experimental/v2/unstable'
 import { assistantBlockToAcp } from './content.ts'
 
 /**
@@ -71,16 +73,107 @@ export async function toolResultUpdate(
   event: SessionEvent<'tool/result'>,
 ): Promise<SessionUpdate> {
   const message = event.data.message
-  const content: ToolCallContent[] = []
-  for (const block of message.content) {
-    const converted = await assistantBlockToAcp(ctx, block)
-    if (converted !== undefined) content.push({ type: 'content' as const, content: converted })
-  }
   return {
     sessionUpdate: 'tool_call_update',
     toolCallId: message.toolCallId,
     status: message.isError === true ? 'failed' : 'completed',
-    content,
+    content: await toolResultContent(ctx, event),
+  }
+}
+
+async function toolResultContent(
+  ctx: Context,
+  event: SessionEvent<'tool/result'>,
+  unavailable?: (error: unknown) => void,
+): Promise<Extract<ToolCallContent, { type: 'content' }>[]> {
+  const content: Extract<ToolCallContent, { type: 'content' }>[] = []
+  for (const block of event.data.message.content) {
+    try {
+      const converted = await assistantBlockToAcp(ctx, block)
+      if (converted !== undefined) content.push({ type: 'content', content: converted })
+    } catch (error: unknown) {
+      if (unavailable === undefined) throw error
+      unavailable(error)
+    }
+  }
+  return content
+}
+
+type V2ToolUpdate = Extract<V2SessionUpdate, { sessionUpdate: 'tool_call_update' }>
+
+function v2ToolId(seq: SessionSeq): string {
+  return `dsh-tool:${seq}`
+}
+
+/** Correlate ACP notices using the retained native call occurrence. */
+export class V2ToolUpdates {
+  private readonly pending = new Map<SessionSeq, SessionEvent<'tool/call'>['data']>()
+
+  /**
+   * Resolve a live approval only when the native provider ID has one pending call.
+   * @param callId - provider ID named by the native permission request.
+   * @returns the ACP ID of the unambiguous pending call, if available.
+   */
+  forApproval(callId: ToolCallId): string | undefined {
+    let match: SessionSeq | undefined
+    for (const [seq, data] of this.pending) {
+      if (data.callId !== callId) continue
+      if (match !== undefined) return undefined
+      match = seq
+    }
+    return match === undefined ? undefined : v2ToolId(match)
+  }
+
+  /**
+   * Record a durable tool fact and return its deferred wire conversion.
+   * @param ctx - bridge context carrying the attachment store and logger.
+   * @param event - native session event.
+   * @returns an ordered wire update operation when the event changes the tool timeline.
+   */
+  observe(ctx: Context, event: SessionEvent): (() => Promise<V2ToolUpdate>) | undefined {
+    if (event.type === 'step/end') {
+      for (const [seq, call] of this.pending) {
+        if (call.turn === event.data.turn && call.step === event.data.step) this.pending.delete(seq)
+      }
+      return undefined
+    }
+    if (event.type === 'tool/call') {
+      this.pending.set(event.seq, event.data)
+      return () => Promise.resolve({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: v2ToolId(event.seq),
+        name: event.data.name,
+        title: event.data.name,
+        kind: 'other',
+        status: 'pending',
+        rawInput: parseToolArguments(event.data.arguments),
+        _meta: { 'nymph.ai/fabric': { nativeToolCallId: event.data.callId } },
+      })
+    }
+    if (event.type !== 'tool/result' || event.surfaceOp !== 'append' || event.sourceEventSeqs?.length !== 1) return undefined
+    const [seq] = event.sourceEventSeqs
+    if (seq === undefined) return undefined
+    const call = this.pending.get(seq)
+    if (call === undefined || call.callId !== event.data.message.toolCallId
+      || call.turn !== event.data.turn || call.step !== event.data.step) return undefined
+    this.pending.delete(seq)
+    const error = event.data.error
+    const cancelled = error?.code === 'ABORTED' || error?.code === 'ABORTED_BEFORE_DISPATCH' || error?.code === 'APPROVAL_CANCELLED'
+    return async () => {
+      const result = { partial: false }
+      const content = await toolResultContent(ctx, event, (failure) => {
+        result.partial = true
+        ctx.logger.warn(`acp v2: tool result content unavailable: ${errorChain(failure)}`)
+      })
+      return {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: v2ToolId(seq),
+        status: cancelled ? 'cancelled' : event.data.message.isError === true ? 'failed' : 'completed',
+        content,
+        ...error === undefined ? {} : { rawOutput: { error } },
+        ...result.partial ? { _meta: { 'nymph.ai/fabric': { toolOutputPartial: true } } } : {},
+      }
+    }
   }
 }
 
