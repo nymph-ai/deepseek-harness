@@ -52,7 +52,7 @@ import type {} from '@deepseek-ai/dsh-session-persistence'
 // Side-effect type import: declaration-merges the approval waterfall answered below.
 import type {} from '@deepseek-ai/dsh-user-approval'
 import { supportsAcpImagePrompts } from './content.ts'
-import { AcpMcpConfigError } from './mcp.ts'
+import { AcpMcpConfigError, channelReplyServers, type ChannelReplyMcp } from './mcp.ts'
 import { AcpModelConfigError } from './model-control.ts'
 import { retainPromptContent, storedPromptContent } from './prompt-content.ts'
 import { AcpSession, type CreateAcpSessionOptions } from './session.ts'
@@ -120,6 +120,7 @@ async function v2Result<T>(run: () => Promise<T>): Promise<T> {
     return await run()
   } catch (error: unknown) {
     if (error instanceof RequestError) throw new v2.RequestError(error.code, error.message, error.data)
+    if (error instanceof AcpMcpConfigError) throw v2.RequestError.invalidParams(undefined, error.message)
     throw error
   }
 }
@@ -181,6 +182,8 @@ export interface AcpConfig {
   protocolV2?: boolean
   /** Absolute persistent signing key path to enable native ACP v2 cursors. */
   cursorSigningKeyFile?: string
+  /** Operator-pinned native stdio channel-reply helper and socket for ACP v2 resume. */
+  channelReplyMcp?: ChannelReplyMcp | undefined
   /** Runtime-only transport override; production uses stdio. */
   stream?: Stream
 }
@@ -191,6 +194,10 @@ export const Config: Schema<AcpConfig> = Schema.object({
   sessionListPageSize: Schema.natural().min(1).default(DEFAULT_SESSION_LIST_PAGE_SIZE),
   protocolV2: Schema.boolean().default(false),
   cursorSigningKeyFile: Schema.string(),
+  channelReplyMcp: Schema.union([
+    Schema.const(undefined),
+    Schema.object({ command: Schema.string().required(), socket: Schema.string().required() }),
+  ]),
 })
 
 /**
@@ -215,6 +222,10 @@ export function apply(ctx: Context, config: AcpConfig): void {
   const signingKey = config.protocolV2 === true && config.cursorSigningKeyFile !== undefined
     ? cursorKey(config.cursorSigningKeyFile)
     : undefined
+  const channelReply = config.protocolV2 === true ? config.channelReplyMcp : undefined
+  if (channelReply !== undefined && (!isAbsolute(channelReply.command) || !isAbsolute(channelReply.socket))) {
+    throw new AcpMcpConfigError('channelReplyMcp requires an absolute executable and socket path')
+  }
 
   const sendV2 = async (sessionId: SessionId, update: v2.SessionUpdate): Promise<void> => {
     await v2Client?.notify(v2.methods.client.session.update, { sessionId, update })
@@ -622,13 +633,17 @@ export function apply(ctx: Context, config: AcpConfig): void {
     .onRequest(v2.methods.agent.initialize, () => ({
       protocolVersion: 2,
       info: { name: 'deepseek-harness-acp', version: '0.0.1' },
-      capabilities: { session: signingKey === undefined ? {} : { fork: {} } },
+      capabilities: { session: {
+        ...signingKey === undefined ? {} : { fork: {} },
+        ...channelReply === undefined ? {} : { mcp: { stdio: {} } },
+      } },
       _meta: {
         'nymph.ai/fabric': {
           keyedTextPrompts: true,
           keyedResourceLinkPrompts: true,
           keyedTextSteering: true,
           ...signingKey === undefined ? {} : { replayFromCursor: FABRIC_CURSOR_REPLAY },
+          ...channelReply === undefined ? {} : { channelReplyMcp: true },
         },
         steering: { supported: true },
       },
@@ -643,10 +658,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
     }))
     .onRequest(v2.methods.agent.session.list, ({ params, signal }) => v2Result(() => implementation.listSessions(params, signal)))
     .onRequest(v2.methods.agent.session.resume, ({ params, signal }) => v2Result(async () => {
-      if (params.additionalDirectories?.length || params.mcpServers?.length || params.systemPrompt != null) {
+      if (params.additionalDirectories?.length || params.systemPrompt != null) {
         throw invalidParams('this ACP v2 preview accepts a primary cwd only')
       }
       const sessionId = brandString<SessionId>(params.sessionId)
+      const mcpServers = channelReplyServers(params.mcpServers, channelReply, sessionId)
       let replayCursorId: string | undefined
       const replay = params.replayFrom
       if (replay != null && replay.type !== 'start') {
@@ -658,7 +674,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
         resolveCursor(sessionId, events, replay.cursorId)
         replayCursorId = replay.cursorId
       }
-      const { configOptions } = await implementation.resumeSession({ sessionId, cwd: params.cwd, mcpServers: [] }, signal)
+      const { configOptions } = await implementation.resumeSession({ sessionId, cwd: params.cwd, mcpServers }, signal)
       try {
         await enqueueV2(sessionId, async () => {
           if (replay != null) {

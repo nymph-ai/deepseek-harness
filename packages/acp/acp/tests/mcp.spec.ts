@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { McpServer } from '@agentclientprotocol/sdk'
 import type { Config as McpClientConfig } from '@deepseek-ai/dsh-mcp-client'
-import { mountAcpMcpServers } from '../src/mcp.ts'
+import { Config } from '../src/index.ts'
+import { channelReplyServers, mountAcpMcpServers } from '../src/mcp.ts'
 
 /** Context stand-in that captures validated MCP configs without opening transports. */
 function captureContext(): { ctx: Context; configs: McpClientConfig[] } {
@@ -112,5 +113,46 @@ describe('ACP MCP declaration mapping', () => {
 
     await expect(mountAcpMcpServers(ctx, [malformed], process.cwd()))
       .rejects.toThrow(/mcpServers\[0\] is invalid/)
+  })
+})
+
+describe('ACP v2 channel reply MCP', () => {
+  const config = { command: process.execPath, socket: '/fixture/fabd.sock' }
+  const sessionId = 'session-for-reply'
+  const declaration = {
+    type: 'stdio' as const,
+    name: 'channel_reply',
+    command: config.command,
+    args: [config.socket, sessionId, 'fixture/source', 'event'],
+    env: [
+      { name: 'FABD_CHANNEL_REPLY_KEY', value: 'ab'.repeat(32) },
+      { name: 'FABD_CHANNEL_REPLY_OWNER_HELLO', value: '1' },
+    ],
+  }
+
+  it('passes just the pinned, session-scoped declaration to the existing mount', () => {
+    expect(Config({ protocolV2: true }).channelReplyMcp).toBeUndefined()
+    expect(Config({ protocolV2: true, channelReplyMcp: config }).channelReplyMcp).toEqual(config)
+    expect(channelReplyServers(undefined, undefined, sessionId)).toEqual([])
+    const { type: _type, ...native } = declaration
+    expect(channelReplyServers([declaration], config, sessionId)).toEqual([native])
+  })
+
+  it('rejects disabled, foreign, non-stdio and extra declarations', () => {
+    expect(() => channelReplyServers([declaration], undefined, sessionId)).toThrow(/configured channel_reply/)
+    expect(() => channelReplyServers([declaration], config, 'another-session')).toThrow(/resumed session/)
+    expect(() => channelReplyServers([declaration, declaration], config, sessionId)).toThrow(/configured channel_reply/)
+    expect(() => channelReplyServers([{
+      type: 'http', name: declaration.name, url: 'https://example.test/mcp',
+    }], config, sessionId)).toThrow(/configured channel_reply/)
+  })
+
+  it('rejects unrecognized, duplicate, or invalid environment entries', () => {
+    const extra = { ...declaration, env: [{ name: 'UNRECOGNIZED', value: 'fixture' }, ...declaration.env] }
+    const duplicate = { ...declaration, env: [declaration.env[0]!, declaration.env[0]!] }
+    const malformed = { ...declaration, env: [{ ...declaration.env[0]!, value: 'invalid' }, declaration.env[1]!] }
+    expect(() => channelReplyServers([extra], config, sessionId)).toThrow(/delegated key/)
+    expect(() => channelReplyServers([duplicate], config, sessionId)).toThrow(/duplicate name/)
+    expect(() => channelReplyServers([malformed], config, sessionId)).toThrow(/delegated key/)
   })
 })

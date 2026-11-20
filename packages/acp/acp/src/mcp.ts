@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto'
 import { validateHeaderName, validateHeaderValue } from 'node:http'
 import { isAbsolute } from 'node:path'
 import type { McpServer } from '@agentclientprotocol/sdk'
+import { McpServer as V2McpServer } from 'acp-v2-sdk/experimental/v2/unstable'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
 
 const VALID_SERVER_NAME = /^[A-Za-z0-9_-]{1,32}$/
@@ -15,6 +16,46 @@ export class AcpMcpConfigError extends Error {
     super(message)
     this.name = 'AcpMcpConfigError'
   }
+}
+
+/** Local operator configuration for the delegated reply transport. */
+export interface ChannelReplyMcp {
+  /** Absolute path to the world-mcp-channel-reply executable. */
+  command: string
+  /** Absolute path to the authenticated fabd socket. */
+  socket: string
+}
+
+/**
+ * Resolve the only ACP v2 MCP server supported by the preview.
+ * @param servers - Optional wire declarations. An empty list mounts no tools.
+ * @param config - The local helper and socket to allow. Omitted configuration rejects all declarations.
+ * @param sessionId - Existing ACP session that will own the MCP client.
+ * @returns The scoped declaration in the native MCP mount's stdio format.
+ */
+export function channelReplyServers(
+  servers: readonly V2McpServer[] | undefined,
+  config: ChannelReplyMcp | undefined,
+  sessionId: string,
+): McpServer[] {
+  if (!servers?.length) return []
+  const [server] = servers
+  if (config === undefined || servers.length !== 1 || server === undefined || !V2McpServer.isStdio(server)
+    || server.name !== 'channel_reply' || server.command !== config.command) {
+    throw new AcpMcpConfigError('ACP v2 only mounts the configured channel_reply stdio server on resume')
+  }
+  const { args = [], env = [] } = server
+  const [socket, session, source, event] = args
+  if (args.length !== 4 || socket !== config.socket || session !== sessionId || !source || !event
+    || /[\u0000-\u001f\u007f]/.test(source) || /[\u0000-\u001f\u007f]/.test(event)) {
+    throw new AcpMcpConfigError('channel_reply MCP arguments must name the configured socket, resumed session, source, and event')
+  }
+  const environment = entriesToRecord(env, 'channel_reply MCP environment', 'environment')
+  if (env.length !== 2 || environment.FABD_CHANNEL_REPLY_OWNER_HELLO !== '1'
+    || !/^[A-Fa-f0-9]{64}$/.test(environment.FABD_CHANNEL_REPLY_KEY ?? '')) {
+    throw new AcpMcpConfigError('channel_reply MCP needs a delegated key and owner hello environment')
+  }
+  return [{ name: server.name, command: config.command, args, env }]
 }
 
 /**
