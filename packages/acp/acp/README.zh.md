@@ -54,6 +54,8 @@ v2 预览版接受文本和资源链接。含资源链接的提示词会在原�
 
 已记录的工具调用显示为等待中。关联的结果提供成功、失败或取消状态，以及已记录的输出。ACP 工具 ID 对应原生调用序号，提供方的工具 ID 记录在 `_meta["nymph.ai/fabric"].nativeToolCallId` 中。实时更新和历史回放使用相同的 ID。缺少关联结果的工具记录保留等待状态。结果附件缺失时，仍会提供状态和可用输出，并在元数据中设置 `toolOutputPartial`。
 
+工具调用正在等待 ACP 审批时会声明 `capabilities.cancel`。`tool_call/cancel` 撤回该调用的权限请求，原生工具结束且工具本体不会执行。原生取消也会撤回发出的权限请求。审批结束时桥接会移除此调用的取消能力，工具开始执行后此方法不可用。
+
 v2 预览版同时声明 `_meta.steering.supported` 和 `_meta["nymph.ai/fabric"].keyedTextSteering`。通过 `_session/steering` 发送文本或资源链接时，可在 `_meta.steering` 中提供 `idempotencyKey` 和 `idleBehavior: "promptRequired"`。输入只会加入当前轮次，并在原生消息持久化后返回回执。空闲时返回 `promptRequired`，不会启动新轮次。重启后可重用已持久化的回执。
 
 配置 `cursorSigningKeyFile` 后，v2 bridge 会在每条保留且未调用工具的助手消息之后公布签名游标。`session/fork` 复制截至该消息的原生事件前缀。使用 `replayFrom: { "type": "_fabric_cursor", "cursorId": "…" }` 可回放已分离会话的后续记录。在末尾恢复时仍会发出 `replay_complete`，但不回放历史。其他锚点类型、无效游标或跨会话游标会返回 `-32602`。
