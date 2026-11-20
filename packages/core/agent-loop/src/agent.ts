@@ -60,6 +60,12 @@ type Phase =
   }
   | { kind: 'running'; abort: AbortController; turn: number; step: number; wakeRequested: boolean }
 
+interface TurnIntake {
+  readonly signal: AbortSignal
+  readonly waiting: UserMessage[]
+  readonly completions: Map<UserMessage['id'], PromiseWithResolvers<boolean>>
+}
+
 type StepEndReason = Extract<TurnEndReason, { kind: 'completed' | 'max-tokens' }>
 
 type PreparedStep =
@@ -113,6 +119,7 @@ export class ReactLoopAgent implements Agent {
   readonly model: AgentModel
   readonly inbox: ReactLoopInbox
   private phase: Phase
+  private turnIntake: TurnIntake | undefined
   private activityDone: Promise<void> = Promise.resolve()
 
   /** The agent-scoped registration boundary; the lifecycle owner unwinds it after the driver exits. */
@@ -187,6 +194,20 @@ export class ReactLoopAgent implements Agent {
 
   inject(input: UserMessage): void {
     this.send(input, 'next-step', false)
+  }
+
+  runningTurnInjector(): ((message: UserMessage) => Promise<boolean>) | undefined {
+    const turn = this.turnIntake
+    if (turn === undefined || turn.signal.aborted) return undefined
+    return (message) => {
+      if (this.turnIntake !== turn || turn.signal.aborted) return Promise.resolve(false)
+      const pending = turn.completions.get(message.id)
+      if (pending !== undefined) return pending.promise
+      const completion = Promise.withResolvers<boolean>()
+      turn.waiting.push(message)
+      turn.completions.set(message.id, completion)
+      return completion.promise
+    }
   }
 
   cancel(cause: AgentCancelCause, options: CancelOptions = {}): void {
@@ -286,11 +307,11 @@ export class ReactLoopAgent implements Agent {
     }
   }
 
-  private async preStep(target: InboxTarget, position: { turn: number; step: number }): Promise<PreparedStep> {
+  private async preStep(target: InboxTarget, position: { turn: number; step: number }, intake: TurnIntake): Promise<PreparedStep> {
     /* v8 ignore next -- private callers establish the running phase before proposing a step */
     if (this.phase.kind !== 'running') throw new Error(`agent "${this.id}": pre-step outside running phase`)
     const signal = this.phase.abort.signal
-    const claimed = this.inbox.claim(target, position.turn)
+    const claimed = [...this.inbox.claim(target, position.turn), ...intake.waiting.splice(0)]
     const selection = this.model.current()
     if (selection === undefined) {
       throw new Error(`agent "${this.id}" has no provider/model: set AgentOptions.provider and AgentOptions.model or record a model selection`)
@@ -344,13 +365,15 @@ export class ReactLoopAgent implements Agent {
       this.throwError(error)
     }
     phase.turn = turn
+    const intake: TurnIntake = { signal, waiting: [], completions: new Map() }
+    this.turnIntake = intake
     let turnEnds: TurnEndReason | null = null
     let target: InboxTarget = 'next-turn'
     try {
       while (true) {
         signal.throwIfAborted()
         const step = phase.step + 1
-        const decision = await this.preStep(target, { turn, step })
+        const decision = await this.preStep(target, { turn, step }, intake)
         if (decision.kind === 'reject') {
           turnEnds = { kind: 'blocked' }
           return false
@@ -373,7 +396,7 @@ export class ReactLoopAgent implements Agent {
           try {
             // max-tokens is sticky: once any step hits the ceiling, later steps
             // that complete normally must not downgrade the turn outcome.
-            const stepEnd = await this.step(decision)
+            const stepEnd = await this.step(decision, intake)
             // max-tokens stays sticky: a later completed step must not
             // downgrade the turn outcome.
             if (turnEnds === null || turnEnds.kind !== 'max-tokens') turnEnds = stepEnd
@@ -398,11 +421,11 @@ export class ReactLoopAgent implements Agent {
           decision.toolSet.dispose()
         }
         signal.throwIfAborted()
-        if (turnEnds && this.inbox.nextStep.length === 0) {
+        if (turnEnds && this.inbox.nextStep.length === 0 && intake.waiting.length === 0) {
           await this.dispatch.serial('agent/turn-stopping', { turn, signal })
           signal.throwIfAborted()
         }
-        if (turnEnds && this.inbox.nextStep.length === 0) break
+        if (turnEnds && this.inbox.nextStep.length === 0 && intake.waiting.length === 0) break
         target = 'next-step'
       }
     } catch (error: unknown) {
@@ -423,6 +446,8 @@ export class ReactLoopAgent implements Agent {
       }
       this.throwError(error)
     } finally {
+      this.turnIntake = undefined
+      for (const completion of intake.completions.values()) completion.resolve(false)
       try {
         // oxlint-disable-next-line typescript/no-non-null-assertion -- every exit assigns a turn ending
         this.session.append('turn/end', { turn, reason: turnEnds! })
@@ -438,7 +463,7 @@ export class ReactLoopAgent implements Agent {
     return true
   }
 
-  private async step(decision: Extract<PreparedStep, { kind: 'enter' }>): Promise<StepEndReason | null> {
+  private async step(decision: Extract<PreparedStep, { kind: 'enter' }>, intake: TurnIntake): Promise<StepEndReason | null> {
     /* v8 ignore next -- private callers establish the running phase before executing a step */
     if (this.phase.kind !== 'running') throw new Error(`agent "${this.id}": step outside running phase`)
     const { turn, step, abort: { signal } } = this.phase
@@ -475,6 +500,11 @@ export class ReactLoopAgent implements Agent {
             }
           } else {
             this.session.append('user/message', message, { surfaceOp: 'append' })
+            const completion = intake.completions.get(message.id)
+            if (completion !== undefined) {
+              intake.completions.delete(message.id)
+              completion.resolve(true)
+            }
           }
         }
       }

@@ -105,7 +105,7 @@ export class AcpSession {
   private outputTail = Promise.resolve()
   private inflight: InflightPrompt | undefined
   private closing: Promise<void> | undefined
-  private readonly keyedPrompts = new Map<MessageId, Promise<{ messageId: string }>>()
+  private readonly keyedInputs = new Map<MessageId, Promise<{ messageId: string } | undefined>>()
 
   private constructor(
     private readonly ctx: Context,
@@ -341,24 +341,15 @@ export class AcpSession {
     onSettled?: (reason: StopReason | 'error') => void,
   ): Promise<{ messageId: string }> {
     this.assertActive()
-    const session = this.agent.session
-    const id = brandString<MessageId>('acp-prompt-v2:' + createHash('sha256')
-      .update(JSON.stringify([session.id, key])).digest('hex'))
-    const pending = this.keyedPrompts.get(id)
-    if (pending !== undefined) return pending
-    const receipt = (async () => {
-      signal.throwIfAborted()
-      const retained = await this.ctx.sessions.flush(session)
-      if (!retained) throw internalError('no session durability listener is available')
-      const reader = await persistence.open(session.id, 'read')
-      try {
-        const { events } = await reader.read()
-        if (events.some(event => event.type === 'user/message' && event.data.id === id)) {
-          return { messageId: id }
-        }
-      } finally {
-        await reader.close()
-      }
+    const id = this.keyedMessageId(key)
+    const pending = this.keyedInputs.get(id)
+    if (pending !== undefined) {
+      const receipt = await pending
+      if (receipt !== undefined) return receipt
+      return this.promptWithId(params, key, imageEnabled, persistence, signal, onSettled)
+    }
+    return this.submitKeyed(id, async () => {
+      if (await this.hasRetainedInput(id, persistence, signal)) return { messageId: id }
       const keyed = { id, committed: false, durable: Promise.withResolvers<void>() }
       void this.prompt(params, imageEnabled, signal, keyed).then(({ stopReason }) => {
         if (keyed.committed) onSettled?.(stopReason)
@@ -372,13 +363,62 @@ export class AcpSession {
       })
       await keyed.durable.promise
       return { messageId: id }
-    })()
-    this.keyedPrompts.set(id, receipt)
+    })
+  }
+
+  /**
+   * Deliver input to the accepting native turn and wait for its durable message.
+   * @param params - the steering content and the session that owns it.
+   * @param key - idempotency key scoped to this native session.
+   * @param persistence - durable history for retained retries.
+   * @param signal - JSON-RPC request cancellation before turn admission.
+   * @returns the retained receipt, or undefined when the turn did not accept input.
+   */
+  async steerWithId(
+    params: PromptRequest,
+    key: string,
+    persistence: SessionPersistence,
+    signal: AbortSignal,
+  ): Promise<{ messageId: string } | undefined> {
+    this.assertActive()
+    const id = this.keyedMessageId(key)
+    const pending = this.keyedInputs.get(id)
+    if (pending !== undefined) return pending
+    const inject = this.agent.runningTurnInjector?.()
+    return this.submitKeyed(id, async () => {
+      if (await this.hasRetainedInput(id, persistence, signal)) return { messageId: id }
+      if (inject === undefined) return undefined
+      const content = await admitAcpPrompt(this.ctx, this.agent.model.current(), params.prompt, false, signal)
+      signal.throwIfAborted()
+      const message = Object.freeze({ ...createUserMessage({ content, source: { kind: 'user' } }), id })
+      if (!await inject(message)) return undefined
+      if (!await this.ctx.sessions.flush(this.agent.session)) throw internalError('no session durability listener is available')
+      return { messageId: id }
+    })
+  }
+
+  private keyedMessageId(key: string): MessageId {
+    return brandString<MessageId>('acp-prompt-v2:' + createHash('sha256')
+      .update(JSON.stringify([this.agent.session.id, key])).digest('hex'))
+  }
+
+  private async hasRetainedInput(id: MessageId, persistence: SessionPersistence, signal: AbortSignal): Promise<boolean> {
+    signal.throwIfAborted()
+    const session = this.agent.session
+    if (!await this.ctx.sessions.flush(session)) throw internalError('no session durability listener is available')
+    const reader = await persistence.open(session.id, 'read')
     try {
-      return await receipt
+      const { events } = await reader.read()
+      return events.some(event => event.type === 'user/message' && event.data.id === id)
     } finally {
-      this.keyedPrompts.delete(id)
+      await reader.close()
     }
+  }
+
+  private submitKeyed<T extends { messageId: string } | undefined>(id: MessageId, submit: () => Promise<T>): Promise<T> {
+    const pending = submit().finally(() => { this.keyedInputs.delete(id) })
+    this.keyedInputs.set(id, pending)
+    return pending
   }
 
   /** Cancel the active prompt, or autonomous work when no ACP prompt exists. */
