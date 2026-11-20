@@ -19,7 +19,7 @@ function unavailable(): RequestError {
   })
 }
 
-function localCatalogChild(event: SessionEvent) {
+export function localCatalogChild(event: SessionEvent) {
   const type: string = event.type
   if (type !== 'subagent/catalog') return undefined
   const data: unknown = event.data
