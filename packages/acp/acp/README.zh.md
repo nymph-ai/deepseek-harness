@@ -62,6 +62,8 @@ v2 预览版同时声明 `_meta.steering.supported` 和 `_meta["nymph.ai/fabric"
 
 显式 v2 回放会恢复只读的一级子会话关联。选中的本地子会话必须已经结束，且父会话目录和子会话头部都确认其归属。桥接先公布子会话，再回放它自己保存的用户和助手消息，并为它发送独立的 `replay_complete`。子回放不包含继承的分叉历史和运行时生成的委派上下文。如果选中的子会话缺失或归属不匹配，桥接会在回放开始前返回 `dsh_child_history_unavailable`。
 
+进程内直属子会话正在运行原生轮次时，其父级关联会公布 `capabilities.cancel`。向该子会话 ID 发送 `session/cancel` 会中断这一个轮次。只有同一轮次记录了祖先中断，且子会话已经空闲，桥接才报告已取消的空闲状态。子会话空闲后收回该能力。已分离的根会话和历史回放均不提供实时控制。
+
 生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-acp)是每个受支持字段及其 JSDoc 的穷尽式真源。
 
 ### 启动服务器
