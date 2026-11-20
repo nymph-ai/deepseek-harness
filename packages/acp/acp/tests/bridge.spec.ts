@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
+import * as v2 from 'acp-v2-sdk/experimental/v2/unstable'
 import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AttachmentError } from '@deepseek-ai/dsh-attachment'
 import LocalFileSystem from '@deepseek-ai/dsh-fs-local'
-import type { ToolCallId, StreamChunk } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, type ToolCallId, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import { SESSION_FORMAT_VERSION, type SessionId, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { SessionHeader } from '@deepseek-ai/dsh-session'
 import { brandString } from '@deepseek-ai/dsh-brand'
@@ -71,6 +72,66 @@ describe('automation-only ACP bridge', () => {
     expect(noStore.agentCapabilities?.promptCapabilities?.image).toBe(false)
   })
 
+  it('negotiates the opt-in ACP v2 preview and retains native prompt receipts across restart', async () => {
+    const persistenceRoot = await mkdtemp(join(tmpdir(), 'dsh-acp-v2-'))
+    const makeHarness = (script: StreamChunk[][] = []) => makeBridgeHarness({
+      script, persistenceRoot, config: { protocolV2: true }, connectV2: true,
+    })
+    const m = v2.methods.agent
+    const cwd = process.cwd()
+    const initialize = (client: v2.ClientContext) => client.request(m.initialize, {
+      protocolVersion: 2, info: { name: 'test', version: '0' },
+    })
+    try {
+      harness = await makeHarness([textResponse('committed answer')])
+      const client = harness.v2Client!
+      await expect(initialize(client)).resolves.toMatchObject({
+        protocolVersion: 2, _meta: { 'nymph.ai/fabric': { keyedTextPrompts: true } },
+      })
+      const { sessionId } = await client.request(m.session.new, { cwd })
+      const params = { sessionId, idempotencyKey: 'keyed', prompt: [{ type: 'text' as const, text: 'retain me' }] }
+      const receipt = await client.request(m.session.prompt, params)
+      await expect(client.request(m.session.prompt, params)).resolves.toEqual(receipt)
+      await vi.waitFor(() => { expect(harness?.v2Updates).toContainEqual({
+        sessionId, update: { sessionUpdate: 'state_update', state: 'idle', stopReason: 'end_turn' },
+      }) })
+      const session = harness.ctx.agents.get(brandString<SessionId>(sessionId))!.session
+      session.append('user/message', createUserMessage({
+        source: { kind: 'system-prompt' },
+        content: [{ type: 'text', text: 'Internal model context' }],
+      }), { surfaceOp: 'append' })
+      expect(harness.adapter.requests).toHaveLength(1)
+      const messages = harness.v2Updates.map(({ update }) => update)
+        .filter(update => update.sessionUpdate === 'user_message' || update.sessionUpdate === 'agent_message')
+      expect(messages).toMatchObject([
+        { sessionUpdate: 'user_message', ...receipt, content: params.prompt },
+        { sessionUpdate: 'agent_message', content: [{ type: 'text', text: 'committed answer' }] },
+      ])
+      await harness.dispose()
+
+      harness = await makeHarness()
+      const reopened = harness.v2Client!
+      await initialize(reopened)
+      await reopened.request(m.session.resume, { sessionId, cwd, replayFrom: { type: 'start' } })
+      expect(harness.v2Updates.map(({ update }) => update)).toEqual([
+        ...messages, { sessionUpdate: 'replay_complete' }, { sessionUpdate: 'state_update', state: 'idle', stopReason: null },
+      ])
+      await expect(reopened.request(m.session.prompt, params)).resolves.toEqual(receipt)
+      expect(harness.adapter.requests).toHaveLength(0)
+    } finally {
+      await harness?.dispose()
+      harness = undefined
+      await rm(persistenceRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps ACP v1 available without the v2 feature marker when the preview is enabled', async () => {
+    harness = await makeBridgeHarness({ config: { protocolV2: true } })
+    const result = await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION })
+    expect(result.protocolVersion).toBe(PROTOCOL_VERSION)
+    expect(result._meta?.['nymph.ai/fabric']).toBeUndefined()
+  })
+
   it('negotiates an unsupported version and accepts the required no-op authentication call', async () => {
     harness = await makeBridgeHarness()
     const response = await harness.client.initialize({ protocolVersion: 0, clientCapabilities: {} })
@@ -97,6 +158,37 @@ describe('automation-only ACP bridge', () => {
     if ('messageId' in harness.updates[0]!) expect(typeof harness.updates[0].messageId).toBe('string')
     expect(harness.ctx.agents.get(brandString<SessionId>(sessionId))?.session.header.cwd).toBe(process.cwd())
     expect(harness.adapter.requests[0]?.messages.at(-1)?.content).toEqual([{ type: 'text', text: 'say hello' }])
+  })
+
+  it('acknowledges a keyed input after durable insertion and reuses it on resume', async () => {
+    harness = await makeBridgeHarness({ script: ['hang'], config: { protocolV2: true }, connectV2: true })
+    const m = v2.methods.agent
+    const client = harness.v2Client!
+    await client.request(m.initialize, { protocolVersion: 2, info: { name: 'test', version: '0' } })
+    const { sessionId } = await client.request(m.session.new, { cwd: process.cwd() })
+    const params = { sessionId, idempotencyKey: 'key-1', prompt: [{ type: 'text' as const, text: 'retain this' }] }
+    const [first, duplicate] = await Promise.all([
+      client.request(m.session.prompt, params),
+      client.request(m.session.prompt, params),
+    ])
+    expect(duplicate).toEqual(first)
+    const stored = await harness.ctx.sessionPersistence.open(brandString<SessionId>(sessionId), 'read')
+    try {
+      const { events } = await stored.read()
+      expect(events.filter(event => event.type === 'user/message')).toMatchObject([
+        { data: { id: first.messageId, content: params.prompt } },
+      ])
+      expect(events.some(event => event.type === 'turn/end')).toBe(false)
+    } finally {
+      await stored.close()
+    }
+    await vi.waitFor(() => { expect(harness?.adapter.requests).toHaveLength(1) })
+    await client.request(m.session.close, { sessionId })
+    await client.request(m.session.resume, { sessionId, cwd: process.cwd() })
+    await expect(client.request(m.session.prompt, {
+      ...params, prompt: [{ type: 'text', text: 'do not insert this' }],
+    })).resolves.toEqual(first)
+    expect(harness.adapter.requests).toHaveLength(1)
   })
 
   it('records the canonical workspace directory in the Session header', async () => {

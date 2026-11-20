@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`dsh-acp` lets trusted programs automate persistent DeepSeek Harness agents through the standard [ACP](https://agentclientprotocol.com): create or resume sessions, select a model and reasoning effort, attach MCP servers, submit or cancel work, receive semantic updates, and close sessions independently. Choose it for out-of-process subagents, test runners, and scripted controllers; it intentionally omits DSH-specific presentation data and interactive UI features. Persistence supports listing, resuming, and closing sessions across process restarts, but deletion, forks, transcript replay, and additional directories are unsupported. Run `pnpm dsh --profile acp` to start the server; use `dsh-subagent-acp` as the repository client.
+`dsh-acp` lets trusted programs automate persistent DeepSeek Harness agents through the standard [ACP](https://agentclientprotocol.com): create or resume sessions, select a model and reasoning effort, attach MCP servers, submit or cancel work, receive semantic updates, and close sessions independently. Choose it for out-of-process subagents, test runners, and scripted controllers; it intentionally omits DSH-specific presentation data and interactive UI features. ACP v1 supports listing, resuming, and closing persisted sessions across restarts. The opt-in ACP v2 preview can also replay text conversations from the start. Run `pnpm dsh --profile acp` to start the server; use `dsh-subagent-acp` as the repository client.
 
 ## Table of Contents
 
@@ -29,7 +29,7 @@ Use this package when a script, test runner, or another harness needs to run age
 
 ### When to choose it
 
-Choose it when automation should own the interaction: an out-of-process subagent, test runner, or scripted controller that manages persistent sessions, tools, model selection, and permissions. Avoid it when a human needs DSH-specific presentation cards, plans, titles, todos, terminal views, or elicitation; this server intentionally exposes only the standard ACP v1 surface.
+Choose it when automation should own the interaction: an out-of-process subagent, test runner, or scripted controller that manages persistent sessions, tools, model selection, and permissions. Avoid it when a human needs DSH-specific presentation cards, plans, titles, todos, terminal views, or elicitation. The server defaults to ACP v1.
 
 ### Minimal configuration
 
@@ -47,6 +47,9 @@ Every session the server creates uses the provider and model configured here. Bo
 | `provider` | — | Provider route for every session's agent |
 | `model` | — | Model for every session's agent |
 | `sessionListPageSize` | `100` | Maximum summaries returned in one `session/list` page |
+| `protocolV2` | `false` | Enable negotiation of the text-focused ACP v2 preview alongside ACP v1 |
+
+The v2 preview acknowledges keyed text prompts after native session persistence and returns the same message ID on retry after restart. Its initialize response advertises `_meta["nymph.ai/fabric"].keyedTextPrompts`. `session/resume` with `replayFrom: { "type": "start" }` replays the text conversation. Cursor replay, tool history, image prompts, client MCP setup, and forks are outside the v2 preview.
 
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-acp) is the exhaustive source for every accepted field and its JSDoc.
 
