@@ -49,7 +49,7 @@ Every session the server creates uses the provider and model configured here. Bo
 | `sessionListPageSize` | `100` | Maximum summaries returned in one `session/list` page |
 | `protocolV2` | `false` | Enable negotiation of the text-focused ACP v2 preview alongside ACP v1 |
 
-The v2 preview acknowledges keyed text prompts after native session persistence and returns the same message ID on retry after restart. Its initialize response advertises `_meta["nymph.ai/fabric"].keyedTextPrompts`. `session/resume` with `replayFrom: { "type": "start" }` replays the text conversation. Cursor replay, tool history, image prompts, client MCP setup, and forks are outside the v2 preview.
+The v2 preview accepts text and resource links, which are rendered as native text without dereferencing the URI. It acknowledges keyed prompts after native session persistence and returns the same message ID on retry after restart. Its initialize response advertises `_meta["nymph.ai/fabric"].keyedTextPrompts`. `session/resume` with `replayFrom: { "type": "start" }` replays the text conversation. Cursor replay, tool history, image prompts, client MCP setup, and forks are outside the v2 preview.
 
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-acp) is the exhaustive source for every accepted field and its JSDoc.
 

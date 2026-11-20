@@ -49,7 +49,7 @@ kind: "package-reference"
 | `sessionListPageSize` | `100` | 单页 `session/list` 返回的最大摘要数量 |
 | `protocolV2` | `false` | 在 ACP v1 之外启用面向文本的 ACP v2 预览版协商 |
 
-v2 预览版在原生会话持久化后确认带幂等键的文本提示词，重启后重试会返回同一消息 ID。初始化响应声明 `_meta["nymph.ai/fabric"].keyedTextPrompts`。为 `session/resume` 传入 `replayFrom: { "type": "start" }` 会回放文本对话。游标回放、工具历史、图像提示词、客户端 MCP 配置及会话分叉不属于本次 v2 预览范围。
+v2 预览版接受文本和资源链接，将链接渲染为原生文本，不访问 URI。它在原生会话持久化后确认带幂等键的提示词，重启后重试会返回同一消息 ID。初始化响应声明 `_meta["nymph.ai/fabric"].keyedTextPrompts`。为 `session/resume` 传入 `replayFrom: { "type": "start" }` 会回放文本对话。游标回放、工具历史、图像提示词、客户端 MCP 配置及会话分叉不属于本次 v2 预览范围。
 
 生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-acp)是每个受支持字段及其 JSDoc 的穷尽式真源。
 
